@@ -28,6 +28,14 @@ type WorkItem struct {
 	Procedure string
 }
 
+// ProcWorkerPool manages workers for a specific procedure
+type ProcWorkerPool struct {
+	Procedure string
+	WorkQueue chan string // SOL IDs only
+	Workers   int
+	Done      chan bool
+}
+
 func init() {
 	flag.StringVar(appCfgFile, "appCfg", "", "Path to the main application configuration file")
 	flag.StringVar(runCfgFile, "runCfg", "", "Path to the extraction configuration file")
@@ -45,6 +53,70 @@ func init() {
 	}
 	if _, err := os.Stat(*runCfgFile); os.IsNotExist(err) {
 		log.Fatalf("Extraction configuration file does not exist: %s", *runCfgFile)
+	}
+}
+
+func processWork(ctx context.Context, db *sql.DB, preparedStmts map[string]*sql.Stmt, 
+	runCfg ExtractionConfig, templates map[string][]ColumnConfig, 
+	procedure, solID, mode string, procLogCh chan ProcLog, 
+	summaryMu *sync.Mutex, procSummary map[string]ProcSummary, 
+	completed *int64, totalItems int, overallStart time.Time) {
+	
+	start := time.Now()
+	var err error
+
+	if mode == "E" {
+		log.Printf("📥 Extracting %s for SOL %s", procedure, solID)
+		stmt := preparedStmts[procedure]
+		err = extractData(ctx, stmt, procedure, solID, &runCfg, templates[procedure])
+	} else if mode == "I" {
+		log.Printf("🔁 Inserting: %s.%s for SOL %s", runCfg.PackageName, procedure, solID)
+		err = callProcedure(ctx, db, runCfg.PackageName, procedure, solID)
+	}
+	end := time.Now()
+
+	plog := ProcLog{
+		SolID:         solID,
+		Procedure:     procedure,
+		StartTime:     start,
+		EndTime:       end,
+		ExecutionTime: end.Sub(start),
+	}
+	if err != nil {
+		plog.Status = "FAIL"
+		plog.ErrorDetails = err.Error()
+	} else {
+		plog.Status = "SUCCESS"
+	}
+	procLogCh <- plog
+
+	summaryMu.Lock()
+	s, exists := procSummary[procedure]
+	if !exists {
+		s = ProcSummary{Procedure: procedure, StartTime: start, EndTime: end, Status: plog.Status}
+	} else {
+		if start.Before(s.StartTime) {
+			s.StartTime = start
+		}
+		if end.After(s.EndTime) {
+			s.EndTime = end
+		}
+		if s.Status != "FAIL" && plog.Status == "FAIL" {
+			s.Status = "FAIL"
+		}
+	}
+	procSummary[procedure] = s
+	summaryMu.Unlock()
+
+	atomic.AddInt64(completed, 1)
+	currentCompleted := atomic.LoadInt64(completed)
+	if currentCompleted%100 == 0 || int(currentCompleted) == totalItems {
+		elapsed := time.Since(overallStart)
+		estimatedTotal := time.Duration(float64(elapsed) / float64(currentCompleted) * float64(totalItems))
+		eta := estimatedTotal - elapsed
+		log.Printf("✅ Progress: %d/%d (%.2f%%) | Elapsed: %s | ETA: %s",
+			currentCompleted, totalItems, float64(currentCompleted)*100/float64(totalItems),
+			elapsed.Round(time.Second), eta.Round(time.Second))
 	}
 }
 
@@ -132,107 +204,81 @@ func main() {
 	go writeLog(filepath.Join(appCfg.LogFilePath, LogFile), procLogCh)
 
 	totalItems := len(sols) * len(runCfg.Procedures)
-	workQueue := make(chan WorkItem, totalItems)
-
-	log.Printf("📦 Populating work queue with %d items...", totalItems)
-	for _, proc := range runCfg.Procedures {
-		for _, sol := range sols {
-			workQueue <- WorkItem{Procedure: proc, SolID: sol}
-		}
-	}
-	close(workQueue)
-
-	var wg sync.WaitGroup
 	overallStart := time.Now()
 	var completed int64
-	var lastProgressTime time.Time
 
-	log.Printf("⚙️ Starting %d workers...", appCfg.Concurrency)
-	for i := 0; i < appCfg.Concurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for item := range workQueue {
-				start := time.Now()
-				var err error
+	// Create procedure-specific worker pools
+	procPools := make([]*ProcWorkerPool, len(runCfg.Procedures))
+	workersPerProc := appCfg.Concurrency / len(runCfg.Procedures)
+	if workersPerProc == 0 {
+		workersPerProc = 1
+	}
+	remainingWorkers := appCfg.Concurrency - (workersPerProc * len(runCfg.Procedures))
 
-				if mode == "E" {
-					log.Printf("📥 Extracting %s for SOL %s", item.Procedure, item.SolID)
-					stmt := preparedStmts[item.Procedure]
-					err = extractData(ctx, stmt, item.Procedure, item.SolID, &runCfg, templates[item.Procedure])
-				} else if mode == "I" {
-					log.Printf("🔁 Inserting: %s.%s for SOL %s", runCfg.PackageName, item.Procedure, item.SolID)
-					err = callProcedure(ctx, db, runCfg.PackageName, item.Procedure, item.SolID)
-				}
-				end := time.Now()
+	log.Printf("📦 Creating %d procedure-specific worker pools...", len(runCfg.Procedures))
+	for i, proc := range runCfg.Procedures {
+		workers := workersPerProc
+		if i < remainingWorkers {
+			workers++
+		}
+		
+		pool := &ProcWorkerPool{
+			Procedure: proc,
+			WorkQueue: make(chan string, len(sols)),
+			Workers:   workers,
+			Done:      make(chan bool),
+		}
+		
+		log.Printf("📥 Populating work queue for %s with %d SOLs, %d workers", proc, len(sols), workers)
+		for _, sol := range sols {
+			pool.WorkQueue <- sol
+		}
+		close(pool.WorkQueue)
+		
+		procPools[i] = pool
+	}
 
-				plog := ProcLog{
-					SolID:         item.SolID,
-					Procedure:     item.Procedure,
-					StartTime:     start,
-					EndTime:       end,
-					ExecutionTime: end.Sub(start),
-				}
-				if err != nil {
-					plog.Status = "FAIL"
-					plog.ErrorDetails = err.Error()
-				} else {
-					plog.Status = "SUCCESS"
-				}
-				procLogCh <- plog
-
-				summaryMu.Lock()
-				s, exists := procSummary[item.Procedure]
-				if !exists {
-					s = ProcSummary{Procedure: item.Procedure, StartTime: start, EndTime: end, Status: plog.Status}
-				} else {
-					if start.Before(s.StartTime) {
-						s.StartTime = start
-					}
-					if end.After(s.EndTime) {
-						s.EndTime = end
-					}
-					if s.Status != "FAIL" && plog.Status == "FAIL" {
-						s.Status = "FAIL"
-					}
-				}
-				procSummary[item.Procedure] = s
-				summaryMu.Unlock()
-
-				atomic.AddInt64(&completed, 1)
-				currentCompleted := atomic.LoadInt64(&completed)
-				now := time.Now()
+	var wg sync.WaitGroup
+	
+	// Start workers for each procedure pool
+	for _, pool := range procPools {
+		for i := 0; i < pool.Workers; i++ {
+			wg.Add(1)
+			go func(p *ProcWorkerPool) {
+				defer wg.Done()
 				
-				// Show progress every 20 seconds or on completion
-				if now.Sub(lastProgressTime) >= 20*time.Second || int(currentCompleted) == totalItems {
-					lastProgressTime = now
-					elapsed := time.Since(overallStart)
-					percentage := float64(currentCompleted) * 100 / float64(totalItems)
-					
-					var etaStr string
-					if currentCompleted > 0 && int(currentCompleted) < totalItems {
-						estimatedTotal := time.Duration(float64(elapsed) / float64(currentCompleted) * float64(totalItems))
-						eta := estimatedTotal - elapsed
-						etaStr = fmt.Sprintf("| ETA: %s", eta.Round(time.Second))
-					} else {
-						etaStr = ""
-					}
-					
-					// Progress bar
-					barWidth := 30
-					filled := int(percentage * float64(barWidth) / 100)
-					bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
-					
-					fmt.Printf("\r[%s] %d/%d (%.1f%%) | Elapsed: %s %s", 
-						bar, currentCompleted, totalItems, percentage, 
-						elapsed.Round(time.Second), etaStr)
-					
-					if int(currentCompleted) == totalItems {
-						fmt.Println() // New line on completion
-					}
+				// Process own procedure's work
+				for solID := range p.WorkQueue {
+					processWork(ctx, db, preparedStmts, runCfg, templates, p.Procedure, solID, 
+						mode, procLogCh, &summaryMu, procSummary, &completed, totalItems, overallStart)
 				}
-			}
-		}()
+				
+				// Signal this procedure is done
+				select {
+				case p.Done <- true:
+				default:
+				}
+				
+				// Work stealing: help other procedures
+				for _, otherPool := range procPools {
+					if otherPool == p {
+						continue
+					}
+					
+					// Try to steal work from other procedures
+					for {
+						select {
+						case solID := <-otherPool.WorkQueue:
+							processWork(ctx, db, preparedStmts, runCfg, templates, otherPool.Procedure, solID,
+								mode, procLogCh, &summaryMu, procSummary, &completed, totalItems, overallStart)
+						default:
+							goto nextPool
+						}
+					}
+					nextPool:
+				}
+			}(pool)
+		}
 	}
 
 	wg.Wait()
