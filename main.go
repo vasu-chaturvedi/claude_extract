@@ -28,12 +28,43 @@ type WorkItem struct {
 	Procedure string
 }
 
-// ProcWorkerPool manages workers for a specific procedure
-type ProcWorkerPool struct {
-	Procedure string
-	WorkQueue chan string // SOL IDs only
-	Workers   int
-	Done      chan bool
+// ProcStats tracks execution metrics for procedures
+type ProcStats struct {
+	TotalExecutions int64
+	TotalDuration   time.Duration
+	FailureCount    int64
+	LastExecution   time.Time
+	AvgDuration     time.Duration
+}
+
+// CircuitBreaker manages procedure health
+type CircuitBreaker struct {
+	FailureThreshold int
+	TimeoutThreshold time.Duration
+	ResetTimeout     time.Duration
+	State            string // "CLOSED", "OPEN", "HALF_OPEN"
+	FailureCount     int
+	LastFailTime     time.Time
+}
+
+// Pipeline represents different execution lanes
+type Pipeline struct {
+	FastLane   chan WorkItem // < 5s procedures
+	MediumLane chan WorkItem // 5-30s procedures  
+	SlowLane   chan WorkItem // > 30s procedures
+	ErrorLane  chan WorkItem // Failed/circuit-broken procedures
+}
+
+// WorkerPool manages the hybrid pipeline architecture
+type WorkerPool struct {
+	Pipeline       *Pipeline
+	ProcStats      map[string]*ProcStats
+	CircuitBreakers map[string]*CircuitBreaker
+	FastWorkers    int
+	MediumWorkers  int
+	SlowWorkers    int
+	ErrorWorkers   int
+	StatsMutex     sync.RWMutex
 }
 
 func init() {
@@ -56,11 +87,121 @@ func init() {
 	}
 }
 
+// createWorkerPool initializes the hybrid pipeline architecture
+func createWorkerPool(concurrency int, procedures []string) *WorkerPool {
+	pipeline := &Pipeline{
+		FastLane:   make(chan WorkItem, 1000),
+		MediumLane: make(chan WorkItem, 1000),
+		SlowLane:   make(chan WorkItem, 1000),
+		ErrorLane:  make(chan WorkItem, 100),
+	}
+	
+	// Distribute workers: 50% fast, 30% medium, 15% slow, 5% error
+	fastWorkers := int(float64(concurrency) * 0.5)
+	mediumWorkers := int(float64(concurrency) * 0.3)
+	slowWorkers := int(float64(concurrency) * 0.15)
+	errorWorkers := concurrency - fastWorkers - mediumWorkers - slowWorkers
+	
+	if fastWorkers == 0 { fastWorkers = 1 }
+	if mediumWorkers == 0 { mediumWorkers = 1 }
+	if slowWorkers == 0 { slowWorkers = 1 }
+	if errorWorkers == 0 { errorWorkers = 1 }
+	
+	wp := &WorkerPool{
+		Pipeline:        pipeline,
+		ProcStats:       make(map[string]*ProcStats),
+		CircuitBreakers: make(map[string]*CircuitBreaker),
+		FastWorkers:     fastWorkers,
+		MediumWorkers:   mediumWorkers,
+		SlowWorkers:     slowWorkers,
+		ErrorWorkers:    errorWorkers,
+	}
+	
+	// Initialize stats and circuit breakers for each procedure
+	for _, proc := range procedures {
+		wp.ProcStats[proc] = &ProcStats{}
+		wp.CircuitBreakers[proc] = &CircuitBreaker{
+			FailureThreshold: 5,
+			TimeoutThreshold: 60 * time.Second,
+			ResetTimeout:     5 * time.Minute,
+			State:           "CLOSED",
+		}
+	}
+	
+	return wp
+}
+
+// categorizeWorkItem determines which lane a work item should go to
+func (wp *WorkerPool) categorizeWorkItem(item WorkItem) chan WorkItem {
+	wp.StatsMutex.RLock()
+	defer wp.StatsMutex.RUnlock()
+	
+	stats := wp.ProcStats[item.Procedure]
+	breaker := wp.CircuitBreakers[item.Procedure]
+	
+	// Check circuit breaker state
+	if breaker.State == "OPEN" {
+		if time.Since(breaker.LastFailTime) > breaker.ResetTimeout {
+			breaker.State = "HALF_OPEN"
+		} else {
+			return wp.Pipeline.ErrorLane
+		}
+	}
+	
+	// No historical data - start with fast lane
+	if stats.TotalExecutions == 0 {
+		return wp.Pipeline.FastLane
+	}
+	
+	// Categorize based on average execution time
+	avgDuration := stats.AvgDuration
+	if avgDuration < 5*time.Second {
+		return wp.Pipeline.FastLane
+	} else if avgDuration < 30*time.Second {
+		return wp.Pipeline.MediumLane
+	} else {
+		return wp.Pipeline.SlowLane
+	}
+}
+
+// updateStats updates procedure execution statistics
+func (wp *WorkerPool) updateStats(procedure string, duration time.Duration, success bool) {
+	wp.StatsMutex.Lock()
+	defer wp.StatsMutex.Unlock()
+	
+	stats := wp.ProcStats[procedure]
+	breaker := wp.CircuitBreakers[procedure]
+	
+	stats.TotalExecutions++
+	stats.TotalDuration += duration
+	stats.LastExecution = time.Now()
+	stats.AvgDuration = time.Duration(int64(stats.TotalDuration) / stats.TotalExecutions)
+	
+	if !success {
+		stats.FailureCount++
+		breaker.FailureCount++
+		breaker.LastFailTime = time.Now()
+		
+		if breaker.FailureCount >= breaker.FailureThreshold {
+			breaker.State = "OPEN"
+			log.Printf("🚨 Circuit breaker OPEN for procedure %s (failures: %d)", procedure, breaker.FailureCount)
+		}
+	} else {
+		// Reset circuit breaker on success
+		if breaker.State == "HALF_OPEN" {
+			breaker.State = "CLOSED"
+			breaker.FailureCount = 0
+			log.Printf("✅ Circuit breaker CLOSED for procedure %s", procedure)
+		}
+	}
+}
+
 func processWork(ctx context.Context, db *sql.DB, preparedStmts map[string]*sql.Stmt, 
 	runCfg ExtractionConfig, templates map[string][]ColumnConfig, 
 	procedure, solID, mode string, procLogCh chan ProcLog, 
 	summaryMu *sync.Mutex, procSummary map[string]ProcSummary, 
-	completed *int64, totalItems int, overallStart time.Time) {
+	completed *int64, totalItems int, overallStart time.Time, 
+	workerPool *WorkerPool) {
 	
 	start := time.Now()
 	var err error
@@ -89,6 +230,9 @@ func processWork(ctx context.Context, db *sql.DB, preparedStmts map[string]*sql.
 		plog.Status = "SUCCESS"
 	}
 	procLogCh <- plog
+	
+	// Update worker pool stats
+	workerPool.updateStats(procedure, plog.ExecutionTime, err == nil)
 
 	summaryMu.Lock()
 	s, exists := procSummary[procedure]
@@ -207,82 +351,106 @@ func main() {
 	overallStart := time.Now()
 	var completed int64
 
-	// Create procedure-specific worker pools
-	procPools := make([]*ProcWorkerPool, len(runCfg.Procedures))
-	workersPerProc := appCfg.Concurrency / len(runCfg.Procedures)
-	if workersPerProc == 0 {
-		workersPerProc = 1
-	}
-	remainingWorkers := appCfg.Concurrency - (workersPerProc * len(runCfg.Procedures))
+	// Create hybrid pipeline worker pool
+	workerPool := createWorkerPool(appCfg.Concurrency, runCfg.Procedures)
+	
+	log.Printf("🏭 Starting hybrid pipeline: Fast(%d) Medium(%d) Slow(%d) Error(%d) workers", 
+		workerPool.FastWorkers, workerPool.MediumWorkers, workerPool.SlowWorkers, workerPool.ErrorWorkers)
 
-	log.Printf("📦 Creating %d procedure-specific worker pools...", len(runCfg.Procedures))
-	for i, proc := range runCfg.Procedures {
-		workers := workersPerProc
-		if i < remainingWorkers {
-			workers++
-		}
-		
-		pool := &ProcWorkerPool{
-			Procedure: proc,
-			WorkQueue: make(chan string, len(sols)),
-			Workers:   workers,
-			Done:      make(chan bool),
-		}
-		
-		log.Printf("📥 Populating work queue for %s with %d SOLs, %d workers", proc, len(sols), workers)
+	// Populate work items and categorize them
+	log.Printf("📦 Categorizing %d work items into pipeline lanes...", totalItems)
+	for _, proc := range runCfg.Procedures {
 		for _, sol := range sols {
-			pool.WorkQueue <- sol
+			item := WorkItem{Procedure: proc, SolID: sol}
+			lane := workerPool.categorizeWorkItem(item)
+			lane <- item
 		}
-		close(pool.WorkQueue)
-		
-		procPools[i] = pool
 	}
+
+	// Close all lanes
+	close(workerPool.Pipeline.FastLane)
+	close(workerPool.Pipeline.MediumLane)
+	close(workerPool.Pipeline.SlowLane)
+	close(workerPool.Pipeline.ErrorLane)
 
 	var wg sync.WaitGroup
-	
-	// Start workers for each procedure pool
-	for _, pool := range procPools {
-		for i := 0; i < pool.Workers; i++ {
-			wg.Add(1)
-			go func(p *ProcWorkerPool) {
-				defer wg.Done()
-				
-				// Process own procedure's work
-				for solID := range p.WorkQueue {
-					processWork(ctx, db, preparedStmts, runCfg, templates, p.Procedure, solID, 
-						mode, procLogCh, &summaryMu, procSummary, &completed, totalItems, overallStart)
-				}
-				
-				// Signal this procedure is done
-				select {
-				case p.Done <- true:
-				default:
-				}
-				
-				// Work stealing: help other procedures
-				for _, otherPool := range procPools {
-					if otherPool == p {
-						continue
-					}
-					
-					// Try to steal work from other procedures
-					for {
-						select {
-						case solID := <-otherPool.WorkQueue:
-							processWork(ctx, db, preparedStmts, runCfg, templates, otherPool.Procedure, solID,
-								mode, procLogCh, &summaryMu, procSummary, &completed, totalItems, overallStart)
-						default:
-							goto nextPool
-						}
-					}
-					nextPool:
-				}
-			}(pool)
-		}
+
+	// Start Fast Lane Workers
+	for i := 0; i < workerPool.FastWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Process fast lane
+			for item := range workerPool.Pipeline.FastLane {
+				processWork(ctx, db, preparedStmts, runCfg, templates, item.Procedure, item.SolID,
+					mode, procLogCh, &summaryMu, procSummary, &completed, totalItems, overallStart, workerPool)
+			}
+			// Help medium lane when fast is done
+			for item := range workerPool.Pipeline.MediumLane {
+				processWork(ctx, db, preparedStmts, runCfg, templates, item.Procedure, item.SolID,
+					mode, procLogCh, &summaryMu, procSummary, &completed, totalItems, overallStart, workerPool)
+			}
+		}()
+	}
+
+	// Start Medium Lane Workers
+	for i := 0; i < workerPool.MediumWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Process medium lane
+			for item := range workerPool.Pipeline.MediumLane {
+				processWork(ctx, db, preparedStmts, runCfg, templates, item.Procedure, item.SolID,
+					mode, procLogCh, &summaryMu, procSummary, &completed, totalItems, overallStart, workerPool)
+			}
+			// Help slow lane when medium is done
+			for item := range workerPool.Pipeline.SlowLane {
+				processWork(ctx, db, preparedStmts, runCfg, templates, item.Procedure, item.SolID,
+					mode, procLogCh, &summaryMu, procSummary, &completed, totalItems, overallStart, workerPool)
+			}
+		}()
+	}
+
+	// Start Slow Lane Workers
+	for i := 0; i < workerPool.SlowWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Process slow lane
+			for item := range workerPool.Pipeline.SlowLane {
+				processWork(ctx, db, preparedStmts, runCfg, templates, item.Procedure, item.SolID,
+					mode, procLogCh, &summaryMu, procSummary, &completed, totalItems, overallStart, workerPool)
+			}
+		}()
+	}
+
+	// Start Error Lane Workers
+	for i := 0; i < workerPool.ErrorWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Process error lane with retry logic
+			for item := range workerPool.Pipeline.ErrorLane {
+				log.Printf("🔄 Retrying failed procedure %s for SOL %s", item.Procedure, item.SolID)
+				processWork(ctx, db, preparedStmts, runCfg, templates, item.Procedure, item.SolID,
+					mode, procLogCh, &summaryMu, procSummary, &completed, totalItems, overallStart, workerPool)
+			}
+		}()
 	}
 
 	wg.Wait()
 	close(procLogCh)
+
+	// Print final statistics
+	log.Printf("📊 Final Procedure Statistics:")
+	workerPool.StatsMutex.RLock()
+	for proc, stats := range workerPool.ProcStats {
+		breaker := workerPool.CircuitBreakers[proc]
+		log.Printf("  %s: Executions=%d, AvgTime=%s, Failures=%d, CircuitState=%s", 
+			proc, stats.TotalExecutions, stats.AvgDuration.Round(time.Millisecond), 
+			stats.FailureCount, breaker.State)
+	}
+	workerPool.StatsMutex.RUnlock()
 
 	writeSummary(filepath.Join(appCfg.LogFilePath, LogFileSummary), procSummary)
 	if mode == "E" {
