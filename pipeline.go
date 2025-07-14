@@ -16,10 +16,10 @@ type Pipeline struct {
 // createPipeline initializes the pipeline with buffered channels
 func createPipeline() *Pipeline {
 	return &Pipeline{
-		FastLane:   make(chan WorkItem, 1000),
-		MediumLane: make(chan WorkItem, 1000),
-		SlowLane:   make(chan WorkItem, 1000),
-		ErrorLane:  make(chan WorkItem, 100),
+		FastLane:   make(chan WorkItem, 20000),
+		MediumLane: make(chan WorkItem, 20000),
+		SlowLane:   make(chan WorkItem, 20000),
+		ErrorLane:  make(chan WorkItem, 5000),
 	}
 }
 
