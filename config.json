@@ -1,0 +1,10 @@
+{
+  "db_user": "your_username",
+  "db_password": "your_password",
+  "db_host": "localhost",
+  "db_port": 1521,
+  "db_sid": "ORCL",
+  "concurrency": 10,
+  "log_path": "./logs",
+  "sol_list_path": "sol_ids.txt"
+}
