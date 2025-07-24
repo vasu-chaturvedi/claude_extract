@@ -148,10 +148,20 @@ func runProceduresWithProcLevelParallelism(ctx context.Context, db *sql.DB, sols
 	wg.Wait()
 }
 
+// Prepared statement cache for procedure calls
+var procStmtCache = NewPreparedStmtCache()
+
 func callProcedure(ctx context.Context, db *sql.DB, pkgName, procName, solID string) error {
 	query := fmt.Sprintf("BEGIN %s.%s(:1); END;", pkgName, procName)
 	start := time.Now()
-	_, err := db.ExecContext(ctx, query, solID)
+	
+	// Use prepared statement cache for procedure calls too
+	stmt, err := procStmtCache.GetOrPrepare(db, query)
+	if err != nil {
+		return fmt.Errorf("failed to prepare procedure statement: %w", err)
+	}
+	
+	_, err = stmt.ExecContext(ctx, solID)
 	
 	// Reduce verbose logging for performance - only log slow procedures
 	duration := time.Since(start)

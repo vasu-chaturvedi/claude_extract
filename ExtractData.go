@@ -17,6 +17,77 @@ import (
 	"time"
 )
 
+// Memory pools for performance optimization
+var (
+	scanArgsPool = sync.Pool{
+		New: func() interface{} {
+			return make([]interface{}, 0, 50) // Pre-allocate capacity for 50 columns
+		},
+	}
+	valuesPool = sync.Pool{
+		New: func() interface{} {
+			return make([]sql.NullString, 0, 50) // Pre-allocate capacity for 50 columns
+		},
+	}
+	stringBuilderPool = sync.Pool{
+		New: func() interface{} {
+			return &strings.Builder{}
+		},
+	}
+)
+
+// Prepared statement cache for performance optimization
+type PreparedStmtCache struct {
+	mu    sync.RWMutex
+	stmts map[string]*sql.Stmt
+}
+
+func NewPreparedStmtCache() *PreparedStmtCache {
+	return &PreparedStmtCache{
+		stmts: make(map[string]*sql.Stmt),
+	}
+}
+
+func (c *PreparedStmtCache) GetOrPrepare(db *sql.DB, query string) (*sql.Stmt, error) {
+	c.mu.RLock()
+	if stmt, exists := c.stmts[query]; exists {
+		c.mu.RUnlock()
+		globalMetrics.RecordCacheHit()
+		return stmt, nil
+	}
+	c.mu.RUnlock()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	
+	// Double-check pattern to avoid race condition
+	if stmt, exists := c.stmts[query]; exists {
+		globalMetrics.RecordCacheHit()
+		return stmt, nil
+	}
+
+	globalMetrics.RecordCacheMiss()
+	stmt, err := db.Prepare(query)
+	if err != nil {
+		return nil, err
+	}
+	
+	c.stmts[query] = stmt
+	return stmt, nil
+}
+
+func (c *PreparedStmtCache) Close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	
+	for _, stmt := range c.stmts {
+		stmt.Close()
+	}
+	c.stmts = make(map[string]*sql.Stmt)
+}
+
+var globalStmtCache = NewPreparedStmtCache()
+
 func runExtractionForSol(ctx context.Context, db *sql.DB, solID string, procConfig *ExtractionConfig, templates map[string][]ColumnConfig, logCh chan<- ProcLog, mu *sync.Mutex, summary map[string]ProcSummary) {
 	var wg sync.WaitGroup
 	procCh := make(chan string)
@@ -125,7 +196,14 @@ func extractData(ctx context.Context, db *sql.DB, procName, solID string, cfg *E
 
 	query := fmt.Sprintf("SELECT %s FROM %s WHERE SOL_ID = :1", strings.Join(colNames, ", "), procName)
 	start := time.Now()
-	rows, err := db.QueryContext(ctx, query, solID)
+	
+	// Use prepared statement cache for better performance
+	stmt, err := globalStmtCache.GetOrPrepare(db, query)
+	if err != nil {
+		return fmt.Errorf("failed to prepare statement: %w", err)
+	}
+	
+	rows, err := stmt.QueryContext(ctx, solID)
 	if err != nil {
 		return fmt.Errorf("query failed: %w", err)
 	}
@@ -139,18 +217,40 @@ func extractData(ctx context.Context, db *sql.DB, procName, solID string, cfg *E
 	}
 	defer f.Close()
 
-	buf := bufio.NewWriter(f)
+	// Use larger buffer for better I/O performance (128KB)
+	buf := bufio.NewWriterSize(f, 128*1024)
 	defer buf.Flush()
 
+	rowCount := int64(0)
+	totalBytes := int64(0)
+	
 	for rows.Next() {
-		values := make([]sql.NullString, len(cols))
-		scanArgs := make([]interface{}, len(cols))
+		// Get objects from pools to reduce allocations
+		values := valuesPool.Get().([]sql.NullString)
+		scanArgs := scanArgsPool.Get().([]interface{})
+		
+		// Resize slices if needed
+		if cap(values) < len(cols) {
+			values = make([]sql.NullString, len(cols))
+		} else {
+			values = values[:len(cols)]
+		}
+		if cap(scanArgs) < len(cols) {
+			scanArgs = make([]interface{}, len(cols))
+		} else {
+			scanArgs = scanArgs[:len(cols)]
+		}
+		
 		for i := range values {
 			scanArgs[i] = &values[i]
 		}
 		if err := rows.Scan(scanArgs...); err != nil {
+			// Return objects to pools before error return
+			valuesPool.Put(values[:0])
+			scanArgsPool.Put(scanArgs[:0])
 			return err
 		}
+		
 		var strValues []string
 		for _, v := range values {
 			if v.Valid {
@@ -159,8 +259,22 @@ func extractData(ctx context.Context, db *sql.DB, procName, solID string, cfg *E
 				strValues = append(strValues, "")
 			}
 		}
-		buf.WriteString(formatRow(cfg, cols, strValues) + "\n")
+		
+		formattedRow := formatRow(cfg, cols, strValues) + "\n"
+		buf.WriteString(formattedRow)
+		
+		rowCount++
+		totalBytes += int64(len(formattedRow))
+		
+		// Return objects to pools for reuse
+		valuesPool.Put(values[:0])
+		scanArgsPool.Put(scanArgs[:0])
 	}
+	
+	// Record performance metrics
+	queryDuration := time.Since(start)
+	globalMetrics.RecordQuery(queryDuration, rowCount, totalBytes)
+	
 	return nil
 }
 
@@ -192,7 +306,8 @@ func mergeFiles(cfg *ExtractionConfig) error {
 		}
 		defer outFile.Close()
 
-		writer := bufio.NewWriter(outFile)
+		// Use larger buffer for merge operations (256KB)
+		writer := bufio.NewWriterSize(outFile, 256*1024)
 		start := time.Now()
 
 		for _, file := range files {
@@ -200,7 +315,11 @@ func mergeFiles(cfg *ExtractionConfig) error {
 			if err != nil {
 				return err
 			}
+			// Use larger scanner buffer for reading (128KB)
 			scanner := bufio.NewScanner(in)
+			scanBuf := make([]byte, 0, 128*1024)
+			scanner.Buffer(scanBuf, 1024*1024) // Max 1MB per line
+			
 			for scanner.Scan() {
 				writer.WriteString(scanner.Text() + "\n")
 			}
@@ -255,14 +374,25 @@ func sanitize(s string) string {
 func formatRow(cfg *ExtractionConfig, cols []ColumnConfig, values []string) string {
 	switch cfg.Format {
 	case "delimited":
-		var parts []string
-		for _, v := range values {
-			parts = append(parts, sanitize(v))
+		// Use string builder from pool for better performance
+		builder := stringBuilderPool.Get().(*strings.Builder)
+		builder.Reset()
+		defer stringBuilderPool.Put(builder)
+		
+		for i, v := range values {
+			if i > 0 {
+				builder.WriteString(cfg.Delimiter)
+			}
+			builder.WriteString(sanitize(v))
 		}
-		return strings.Join(parts, cfg.Delimiter)
+		return builder.String()
 
 	case "fixed":
-		var out strings.Builder
+		// Use string builder from pool for better performance
+		builder := stringBuilderPool.Get().(*strings.Builder)
+		builder.Reset()
+		defer stringBuilderPool.Put(builder)
+		
 		for i, col := range cols {
 			var val string
 			if i < len(values) && values[i] != "" {
@@ -276,12 +406,12 @@ func formatRow(cfg *ExtractionConfig, cols []ColumnConfig, values []string) stri
 			}
 
 			if col.Align == "right" {
-				out.WriteString(fmt.Sprintf("%*s", col.Length, val))
+				builder.WriteString(fmt.Sprintf("%*s", col.Length, val))
 			} else {
-				out.WriteString(fmt.Sprintf("%-*s", col.Length, val))
+				builder.WriteString(fmt.Sprintf("%-*s", col.Length, val))
 			}
 		}
-		return out.String()
+		return builder.String()
 
 	default:
 		return ""

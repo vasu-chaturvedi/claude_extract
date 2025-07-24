@@ -77,15 +77,20 @@ func main() {
 	defer db.Close()
 
 	procCount := len(runCfg.Procedures)
-	// Optimize connection pool for high concurrency
+	// Optimize connection pool for high concurrency with improved settings
 	maxConns := appCfg.Concurrency * procCount
 	if maxConns > 200 {
 		log.Printf("⚠️ Warning: Connection pool size (%d) may exceed database limits", maxConns)
+		maxConns = 200 // Cap at reasonable limit
 	}
+	
+	// Enhanced connection pool configuration for better performance
 	db.SetMaxOpenConns(maxConns)
-	db.SetMaxIdleConns(maxConns / 2) // Reduce idle connections
-	db.SetConnMaxLifetime(15 * time.Minute) // Shorter lifetime for high throughput
-	db.SetConnMaxIdleTime(5 * time.Minute)  // Close idle connections faster
+	db.SetMaxIdleConns(maxConns / 3) // Reduce idle connections more aggressively
+	db.SetConnMaxLifetime(10 * time.Minute) // Even shorter lifetime for high throughput
+	db.SetConnMaxIdleTime(3 * time.Minute)  // Close idle connections faster
+	
+	log.Printf("🔌 Connection pool configured: %d max connections, %d idle connections", maxConns, maxConns/3)
 
 	sols, err := readSols(appCfg.SolFilePath)
 	if err != nil {
@@ -206,9 +211,27 @@ func main() {
 	if mode == "E" {
 		mergeFiles(&runCfg)
 	}
+	
+	// Clean up prepared statements
+	globalStmtCache.Close()
+	procStmtCache.Close()
+	
 	// Final performance summary
 	finalStats := db.Stats()
 	log.Printf("📊 Final DB Stats: MaxOpen=%d, Open=%d, InUse=%d, Idle=%d, WaitCount=%d, WaitDuration=%s",
 		finalStats.MaxOpenConnections, finalStats.OpenConnections, finalStats.InUse, finalStats.Idle, finalStats.WaitCount, finalStats.WaitDuration)
+	
+	// Performance metrics summary
+	totalQueries, avgDuration, cacheHitRate, slowQueries := globalMetrics.GetStats()
+	totalRowsProcessed := globalMetrics.TotalRowsProcessed
+	totalBytesWritten := globalMetrics.TotalBytesWritten
+	
+	log.Printf("⚡ Performance Summary:")
+	log.Printf("   🔢 Total Queries: %d", totalQueries)
+	log.Printf("   ⏱️  Average Query Time: %s", avgDuration.Round(time.Millisecond))
+	log.Printf("   💾 Cache Hit Rate: %.1f%%", cacheHitRate)
+	log.Printf("   🐌 Slow Queries (>1s): %d", slowQueries)
+	log.Printf("   📊 Rows Processed: %d", totalRowsProcessed)
+	log.Printf("   💿 Bytes Written: %.2f MB", float64(totalBytesWritten)/(1024*1024))
 	log.Printf("🎯 All done! Processed %d SOLs in %s", totalSols, time.Since(overallStart).Round(time.Second))
 }
