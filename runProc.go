@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 	"runtime"
 	"sync"
 	"time"
@@ -18,7 +18,10 @@ type ProcTask struct {
 func runProceduresForSol(ctx context.Context, db *sql.DB, solID string, procConfig *ExtractionConfig, logCh chan<- ProcLog, mu *sync.Mutex, summary map[string]ProcSummary) {
 	for _, proc := range procConfig.Procedures {
 		start := time.Now()
-		log.Printf("🔁 Inserting: %s.%s for SOL %s", procConfig.PackageName, proc, solID)
+		slog.Debug("Starting procedure insertion", 
+			"package", procConfig.PackageName, 
+			"procedure", proc, 
+			"sol_id", solID)
 		err := callProcedure(ctx, db, procConfig.PackageName, proc, solID)
 		end := time.Now()
 
@@ -57,6 +60,81 @@ func runProceduresForSol(ctx context.Context, db *sql.DB, solID string, procConf
 	}
 }
 
+// TaskTracker provides enhanced tracking for SOL-procedure combinations
+type TaskTracker struct {
+	mu                  sync.RWMutex
+	totalTasks         int
+	completedTasks     int
+	successfulTasks    int
+	failedTasks        int
+	procedureCounts    map[string]int     // completed per procedure
+	procedureFailures  map[string]int     // failures per procedure
+	procedureTotals    map[string]int     // total per procedure
+	startTime          time.Time
+	lastReportTime     time.Time
+}
+
+func NewTaskTracker(sols []string, procedures []string) *TaskTracker {
+	totalTasks := len(sols) * len(procedures)
+	procedureTotals := make(map[string]int)
+	procedureCounts := make(map[string]int)
+	procedureFailures := make(map[string]int)
+	
+	for _, proc := range procedures {
+		procedureTotals[proc] = len(sols)
+		procedureCounts[proc] = 0
+		procedureFailures[proc] = 0
+	}
+	
+	return &TaskTracker{
+		totalTasks:        totalTasks,
+		procedureTotals:   procedureTotals,
+		procedureCounts:   procedureCounts,
+		procedureFailures: procedureFailures,
+		startTime:         time.Now(),
+		lastReportTime:    time.Now(),
+	}
+}
+
+func (tt *TaskTracker) UpdateTask(procedure string, success bool) {
+	tt.mu.Lock()
+	defer tt.mu.Unlock()
+	
+	tt.completedTasks++
+	if success {
+		tt.successfulTasks++
+		tt.procedureCounts[procedure]++
+	} else {
+		tt.failedTasks++
+		tt.procedureFailures[procedure]++
+	}
+}
+
+func (tt *TaskTracker) GetStats() (int, int, int, int, float64, time.Duration) {
+	tt.mu.RLock()
+	defer tt.mu.RUnlock()
+	
+	elapsed := time.Since(tt.startTime)
+	rate := float64(tt.completedTasks) / elapsed.Seconds()
+	
+	return tt.completedTasks, tt.totalTasks, tt.successfulTasks, tt.failedTasks, rate, elapsed
+}
+
+func (tt *TaskTracker) GetProcedureStats() map[string][3]int {
+	tt.mu.RLock()
+	defer tt.mu.RUnlock()
+	
+	stats := make(map[string][3]int) // [completed, failed, total]
+	for proc := range tt.procedureTotals {
+		stats[proc] = [3]int{
+			tt.procedureCounts[proc],
+			tt.procedureFailures[proc], 
+			tt.procedureTotals[proc],
+		}
+	}
+	return stats
+}
+
 func runProceduresWithProcLevelParallelism(ctx context.Context, db *sql.DB, sols []string, procConfig *ExtractionConfig, logCh chan<- ProcLog, mu *sync.Mutex, summary map[string]ProcSummary, concurrency int) {
 	// Scale task channel buffer based on workload
 	taskBufferSize := len(sols) * len(procConfig.Procedures)
@@ -72,6 +150,86 @@ func runProceduresWithProcLevelParallelism(ctx context.Context, db *sql.DB, sols
 	overallStart := time.Now()
 	var progressMu sync.Mutex
 	completed := 0
+	
+	// Initialize enhanced task tracker
+	tracker := NewTaskTracker(sols, procConfig.Procedures)
+	var lastDashboardTime time.Time
+
+	// Start dashboard monitoring goroutine
+	go func() {
+		dashboardTicker := time.NewTicker(30 * time.Second)
+		defer dashboardTicker.Stop()
+		
+		for range dashboardTicker.C {
+			completedTasks, totalTasks, successful, failed, rate, elapsed := tracker.GetStats()
+			if completedTasks > 0 {
+				remaining := totalTasks - completedTasks
+				eta := time.Duration(float64(remaining) / rate) * time.Second
+				
+				slog.Info("Task execution dashboard",
+					"completed_tasks", completedTasks,
+					"total_tasks", totalTasks,
+					"progress_percent", fmt.Sprintf("%.1f", float64(completedTasks)*100/float64(totalTasks)),
+					"successful", successful,
+					"failed", failed,
+					"rate_per_second", fmt.Sprintf("%.1f", rate),
+					"elapsed", elapsed.Round(time.Second).String(),
+					"eta", eta.Round(time.Second).String(),
+					"sol_count", len(sols),
+					"procedure_count", len(procConfig.Procedures))
+				
+				// Show database connection stats
+				dbStats := db.Stats()
+				slog.Info("Database connection stats",
+					"active", dbStats.InUse,
+					"idle", dbStats.Idle,
+					"waiting", dbStats.WaitCount,
+					"max_connections", dbStats.MaxOpenConnections)
+				
+				// Show performance metrics if available
+				if globalMetrics != nil {
+					totalQueries, avgDuration, cacheHitRate, slowQueries := globalMetrics.GetStats()
+					if totalQueries > 0 {
+						slog.Info("Performance metrics",
+							"cache_hit_rate_percent", fmt.Sprintf("%.1f", cacheHitRate),
+							"avg_query_ms", avgDuration.Milliseconds(),
+							"slow_queries", slowQueries)
+					}
+				}
+				
+				// Show per-procedure breakdown
+				procStats := tracker.GetProcedureStats()
+				slog.Info("Procedure breakdown summary")
+				for _, proc := range procConfig.Procedures {
+					if stats, exists := procStats[proc]; exists {
+						completed := stats[0] + stats[1] // success + failed
+						total := stats[2]
+						successCount := stats[0]
+						failedCount := stats[1]
+						progress := float64(completed) * 100 / float64(total)
+						
+						status := "🟢"
+						if failedCount > 0 {
+							status = "🟡"
+							if failedCount > successCount {
+								status = "🔴"
+							}
+						}
+						
+						slog.Info("Procedure stats",
+							"procedure", proc,
+							"completed", completed,
+							"total", total,
+							"progress_percent", fmt.Sprintf("%.1f", progress),
+							"successful", successCount,
+							"failed", failedCount,
+							"status", status)
+					}
+				}
+				slog.Info("Dashboard update complete")
+			}
+		}
+	}()
 
 	for range concurrency {
 		wg.Add(1)
@@ -79,27 +237,64 @@ func runProceduresWithProcLevelParallelism(ctx context.Context, db *sql.DB, sols
 			defer wg.Done()
 			for task := range taskCh {
 				start := time.Now()
-							// Reduce verbose logging to improve performance
+				
+				// Enhanced task logging with queue info
+				queueRemaining := len(taskCh)
+				completedSoFar, _, _, _, _, _ := tracker.GetStats()
+				taskNumber := completedSoFar + 1
+				
 				if runtime.GOMAXPROCS(0) <= 4 {
-					log.Printf("🔁 Inserting: %s.%s for SOL %s", procConfig.PackageName, task.Proc, task.SolID)
+					slog.Debug("Starting task", 
+						"task_num", taskNumber, 
+						"total_tasks", totalTasks, 
+						"package", procConfig.PackageName, 
+						"procedure", task.Proc, 
+						"sol_id", task.SolID, 
+						"queue_remaining", queueRemaining)
 				}
+				
 				err := callProcedure(ctx, db, procConfig.PackageName, task.Proc, task.SolID)
 				end := time.Now()
+				duration := end.Sub(start)
 
 				plog := ProcLog{
 					SolID:         task.SolID,
 					Procedure:     task.Proc,
 					StartTime:     start,
 					EndTime:       end,
-					ExecutionTime: end.Sub(start),
+					ExecutionTime: duration,
 				}
+				
+				success := err == nil
 				if err != nil {
 					plog.Status = "FAIL"
 					plog.ErrorDetails = err.Error()
+					if runtime.GOMAXPROCS(0) <= 4 {
+						slog.Error("Task failed", 
+							"task_num", taskNumber, 
+							"total_tasks", totalTasks, 
+							"package", procConfig.PackageName, 
+							"procedure", task.Proc, 
+							"sol_id", task.SolID, 
+							"duration", duration.Round(time.Millisecond).String(), 
+							"error", err.Error())
+					}
 				} else {
 					plog.Status = "SUCCESS"
+					if runtime.GOMAXPROCS(0) <= 4 {
+						slog.Debug("Task completed successfully", 
+							"task_num", taskNumber, 
+							"total_tasks", totalTasks, 
+							"package", procConfig.PackageName, 
+							"procedure", task.Proc, 
+							"sol_id", task.SolID, 
+							"duration", duration.Round(time.Millisecond).String())
+					}
 				}
 				logCh <- plog
+
+				// Update enhanced tracker
+				tracker.UpdateTask(task.Proc, success)
 
 				// Batch summary updates to reduce mutex contention
 				mu.Lock()
@@ -120,20 +315,35 @@ func runProceduresWithProcLevelParallelism(ctx context.Context, db *sql.DB, sols
 				summary[task.Proc] = s
 				mu.Unlock()
 
-				// Optimize progress reporting to reduce mutex contention
+				// Enhanced progress reporting
 				progressMu.Lock()
 				completed++
 				localCompleted := completed
 				progressMu.Unlock()
 				
-				// Only log progress at intervals to reduce lock contention
-				if localCompleted%100 == 0 || localCompleted == totalTasks {
+				// More frequent progress updates with enhanced info
+				if localCompleted%10 == 0 || localCompleted == totalTasks || time.Since(lastDashboardTime) > 15*time.Second {
 					elapsed := time.Since(overallStart)
-					estimatedTotal := time.Duration(float64(elapsed) / float64(localCompleted) * float64(totalTasks))
-					eta := estimatedTotal - elapsed
-					log.Printf("✅ Progress: %d/%d (%.2f%%) | Elapsed: %s | ETA: %s",
-						localCompleted, totalTasks, float64(localCompleted)*100/float64(totalTasks),
-						elapsed.Round(time.Second), eta.Round(time.Second))
+					rate := float64(localCompleted) / elapsed.Seconds()
+					eta := time.Duration(float64(totalTasks-localCompleted) / rate) * time.Second
+					
+					successCount, failCount := 0, 0
+					procStats := tracker.GetProcedureStats()
+					for _, stats := range procStats {
+						successCount += stats[0]
+						failCount += stats[1]
+					}
+					
+					slog.Info("Task progress", 
+						"completed", localCompleted, 
+						"total", totalTasks, 
+						"progress_percent", fmt.Sprintf("%.1f", float64(localCompleted)*100/float64(totalTasks)),
+						"rate_per_second", fmt.Sprintf("%.1f", rate), 
+						"successful", successCount, 
+						"failed", failCount,
+						"eta", eta.Round(time.Second).String())
+					
+					lastDashboardTime = time.Now()
 				}
 			}
 		}()
@@ -166,9 +376,17 @@ func callProcedure(ctx context.Context, db *sql.DB, pkgName, procName, solID str
 	// Reduce verbose logging for performance - only log slow procedures
 	duration := time.Since(start)
 	if duration > 5*time.Second {
-		log.Printf("⚠️ Slow procedure: %s.%s for SOL %s took %s", pkgName, procName, solID, duration.Round(time.Millisecond))
+		slog.Warn("Slow procedure detected", 
+			"package", pkgName, 
+			"procedure", procName, 
+			"sol_id", solID, 
+			"duration", duration.Round(time.Millisecond).String())
 	} else if duration > 1*time.Second {
-		log.Printf("✅ Finished: %s.%s for SOL %s in %s", pkgName, procName, solID, duration.Round(time.Millisecond))
+		slog.Debug("Procedure completed", 
+			"package", pkgName, 
+			"procedure", procName, 
+			"sol_id", solID, 
+			"duration", duration.Round(time.Millisecond).String())
 	}
 	return err
 }

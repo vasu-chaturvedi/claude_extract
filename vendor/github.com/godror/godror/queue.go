@@ -1,4 +1,4 @@
-// Copyright 2019, 2023 The Godror Authors
+// Copyright 2019, 2025 The Godror Authors
 //
 //
 // SPDX-License-Identifier: UPL-1.0 OR Apache-2.0
@@ -42,13 +42,16 @@ var DefaultDeqOptions = DeqOptions{
 
 // Queue represents an Oracle Advanced Queue.
 type Queue struct {
-	PayloadObjectType *ObjectType
-	conn              *conn
-	dpiQueue          *C.dpiQueue
-	name              string
-	props             []*C.dpiMsgProps
-	mu                sync.Mutex
-	connIsOwned       bool
+	PayloadObjectType              *ObjectType
+	conn                           *conn
+	dpiQueue                       *C.dpiQueue
+	name                           string
+	defDeqOpts                     DeqOptions
+	defEnqOpts                     EnqOptions
+	props                          []*C.dpiMsgProps
+	mu                             sync.Mutex
+	connIsOwned                    bool
+	deqOptsTainted, enqOptsTainted bool
 }
 
 type queueOption interface{ qOption() }
@@ -68,18 +71,21 @@ func NewQueue(ctx context.Context, execer Execer, name string, payloadObjectType
 	if err != nil {
 		return nil, err
 	}
-	// Check whether this is a pool or a single connection.
-	cx2, err := DriverConn(ctx, execer)
-	if err != nil {
-		cx.Close()
-		return nil, err
+	var execerIsPool bool
+	{
+		// Check whether this is a pool or a single connection.
+		cx2, err := DriverConn(ctx, execer)
+		if err != nil {
+			cx.Close()
+			return nil, err
+		}
+		//fmt.Printf("cx=%p cx2=%p\n", cx.(*conn).dpiConn, cx2.(*conn).dpiConn)
+		if cx.(*conn).dpiConn != cx2.(*conn).dpiConn {
+			execerIsPool = true
+			cx2.Close()
+		}
 	}
-	//fmt.Printf("cx=%p cx2=%p\n", cx.(*conn).dpiConn, cx2.(*conn).dpiConn)
-	owned := cx.(*conn).dpiConn != cx2.(*conn).dpiConn
-	if owned {
-		cx2.Close()
-	}
-	Q := Queue{conn: cx.(*conn), name: name, connIsOwned: owned}
+	Q := Queue{conn: cx.(*conn), name: name, connIsOwned: execerIsPool}
 
 	var payloadType *C.dpiObjectType
 	if payloadObjectTypeName != "" {
@@ -139,6 +145,8 @@ func NewQueue(ctx context.Context, execer Execer, name string, payloadObjectType
 		Q.Close()
 		return nil, err
 	}
+	Q.defEnqOpts = enqOpts
+	Q.defDeqOpts = deqOpts
 	return &Q, nil
 }
 
@@ -147,20 +155,21 @@ func (Q *Queue) Close() error {
 	if Q == nil {
 		return nil
 	}
-	c, q := Q.conn, Q.dpiQueue
-	Q.conn, Q.dpiQueue = nil, nil
+	c, q, ot := Q.conn, Q.dpiQueue, Q.PayloadObjectType
+	Q.conn, Q.dpiQueue, Q.PayloadObjectType = nil, nil, nil
 	if q == nil {
 		return nil
 	}
 	if err := c.checkExec(func() C.int { return C.dpiQueue_release(q) }); err != nil {
 		return fmt.Errorf("release: %w", err)
 	}
-	if Q.PayloadObjectType != nil && Q.PayloadObjectType.dpiObjectType != nil {
-		Q.PayloadObjectType.Close()
-		Q.PayloadObjectType = nil
-	}
-	if c != nil && Q.connIsOwned {
-		c.Close()
+	if Q.connIsOwned {
+		if ot != nil && ot.dpiObjectType != nil {
+			ot.Close()
+		}
+		if c != nil {
+			c.Close()
+		}
 	}
 	return nil
 }
@@ -207,11 +216,32 @@ func (Q *Queue) DeqOptions() (DeqOptions, error) {
 // Dequeues messages into the given slice.
 // Returns the number of messages filled in the given slice.
 func (Q *Queue) Dequeue(messages []Message) (int, error) {
+	return Q.DequeueWithOptions(messages, nil)
+}
+
+// DequeueWithOptions messages into the given slice using the given (the Queue-default if nil) options.
+// Returns the number of messages filled in the given slice.
+func (Q *Queue) DequeueWithOptions(messages []Message, opts *DeqOptions) (int, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
 	Q.mu.Lock()
 	defer Q.mu.Unlock()
+	if opts != nil {
+		Q.deqOptsTainted = true
+	}
+	if Q.deqOptsTainted {
+		D := Q.defDeqOpts
+		if opts == nil {
+			Q.deqOptsTainted = false
+		} else {
+			D = *opts
+		}
+		if err := Q.SetDeqOptions(D); err != nil {
+			return 0, err
+		}
+	}
+
 	var props []*C.dpiMsgProps
 	if cap(Q.props) >= len(messages) {
 		props = Q.props[:len(messages)]
@@ -299,11 +329,35 @@ func (Q *Queue) start() error {
 // Ensure that this function is not run in parallel, use standalone connections or connections from different pools, or make multiple calls to Queue.enqOne() instead.
 // The function Queue.Dequeue() call is not affected.
 func (Q *Queue) Enqueue(messages []Message) error {
+	return Q.EnqueueWithOptions(messages, nil)
+}
+
+// EnqueueWithOptions all the messages given, using the given options (the Queue-default if nil).
+//
+// WARNING: calling this function in parallel on different connections acquired from the same pool may fail due to Oracle bug 29928074.
+// Ensure that this function is not run in parallel, use standalone connections or connections from different pools, or make multiple calls to Queue.enqOne() instead.
+// The function Queue.Dequeue() call is not affected.
+func (Q *Queue) EnqueueWithOptions(messages []Message, opts *EnqOptions) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
 	Q.mu.Lock()
 	defer Q.mu.Unlock()
+	if opts != nil {
+		Q.enqOptsTainted = true
+	}
+	if Q.enqOptsTainted {
+		E := Q.defEnqOpts
+		if opts == nil {
+			Q.enqOptsTainted = false
+		} else {
+			E = *opts
+		}
+		if err := Q.SetEnqOptions(E); err != nil {
+			return err
+		}
+	}
+
 	var props []*C.dpiMsgProps
 	if cap(Q.props) >= len(messages) {
 		props = Q.props[:len(messages)]

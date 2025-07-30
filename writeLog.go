@@ -4,18 +4,20 @@ import (
 	"bufio"
 	"encoding/csv"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
-	"sort"
+	"slices"
 )
 
 // Optimized async logging with batching to reduce I/O bottlenecks
 func writeLog(path string, logCh <-chan ProcLog) {
 	file, err := os.Create(path)
 	if err != nil {
-		log.Fatalf("Failed to create procedure log file: %v", err)
+		slog.Error("Failed to create procedure log file", "path", path, "error", err)
+		return
 	}
 	defer file.Close()
+	slog.Info("Procedure log file created", "path", path)
 
 	// Use buffered writer for better I/O performance
 	bufWriter := bufio.NewWriterSize(file, 64*1024) // 64KB buffer
@@ -27,8 +29,8 @@ func writeLog(path string, logCh <-chan ProcLog) {
 	// Write header
 	writer.Write([]string{"SOL_ID", "PROCEDURE", "START_TIME", "END_TIME", "EXECUTION_SECONDS", "STATUS", "ERROR_DETAILS"})
 
-	// Batch writes to reduce I/O overhead
-	batchSize := 100
+	// Batch writes to reduce I/O overhead (reduced for more frequent updates)
+	batchSize := 10
 	batch := make([][]string, 0, batchSize)
 	timeFormat := "02-01-2006 15:04:05"
 
@@ -66,10 +68,11 @@ func writeLog(path string, logCh <-chan ProcLog) {
 func writeSummary(path string, summary map[string]ProcSummary) {
 	file, err := os.Create(path)
 	if err != nil {
-		log.Printf("Failed to create procedure summary file: %v", err)
+		slog.Error("Failed to create procedure summary file", "path", path, "error", err)
 		return
 	}
 	defer file.Close()
+	slog.Info("Writing procedure summary", "path", path, "procedure_count", len(summary))
 
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
@@ -82,7 +85,7 @@ func writeSummary(path string, summary map[string]ProcSummary) {
 	for p := range summary {
 		procs = append(procs, p)
 	}
-	sort.Strings(procs)
+	slices.Sort(procs)
 
 	for _, p := range procs {
 		s := summary[p]

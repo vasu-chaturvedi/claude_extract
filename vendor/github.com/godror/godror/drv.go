@@ -709,6 +709,12 @@ func (d *drv) acquireConn(pool *connPool, P commonAndConnParams) (*C.dpiConn, bo
 			cleanup()
 		}
 		if pool != nil {
+			if connCreateParams.numShardingKeyColumns != 0 {
+				var ec interface{ Code() int }
+				if errors.As(err, &ec) && ec.Code() == 24459 { //  https://github.com/godror/godror/issues/379#issuecomment-3107438057
+					return nil, false, nil, fmt.Errorf("sharding=%+v for pooled connection failed: %w", P.ShardingKey, err)
+				}
+			}
 			stats, _ := d.getPoolStats(pool)
 			return nil, false, nil, fmt.Errorf("pool=%p stats=%s params=%+v: %w",
 				pool.dpiPool, stats, connCreateParams, err)

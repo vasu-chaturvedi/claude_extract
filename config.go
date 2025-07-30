@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"slices"
 )
@@ -37,29 +38,33 @@ type ExtractionConfig struct {
 func loadMainConfig(path string) (MainConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return MainConfig{}, err
+		return MainConfig{}, fmt.Errorf("failed to read main config file %s: %w", path, err)
 	}
 
 	var cfg MainConfig
-	err = json.Unmarshal(data, &cfg)
-	return cfg, err
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return MainConfig{}, fmt.Errorf("failed to parse main config file %s: %w", path, err)
+	}
+	return cfg, nil
 }
 
 func loadExtractionConfig(path string) (ExtractionConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return ExtractionConfig{}, err
+		return ExtractionConfig{}, fmt.Errorf("failed to read extraction config file %s: %w", path, err)
 	}
 
 	var cfg ExtractionConfig
-	err = json.Unmarshal(data, &cfg)
-	return cfg, err
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return ExtractionConfig{}, fmt.Errorf("failed to parse extraction config file %s: %w", path, err)
+	}
+	return cfg, nil
 }
 
 func readSols(path string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open SOL file %s: %w", path, err)
 	}
 	defer f.Close()
 
@@ -71,7 +76,10 @@ func readSols(path string) ([]string, error) {
 			sols = append(sols, line)
 		}
 	}
-	return sols, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read SOL file %s: %w", path, err)
+	}
+	return sols, nil
 }
 
 // Check if a procedure uses chunked logic

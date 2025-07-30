@@ -154,6 +154,11 @@ static int dpiConn__close(dpiConn *conn, uint32_t mode, const char *tag,
             dpiOci__transRollback(conn, propagateErrors, error) < 0)
         conn->deadSession = 1;
 
+    // Unset the tranasaction handle if one exists currently
+    // (Required for tpc and sessionless transactions when the active
+    // transaction is released to a pool without suspending)
+    dpiConn__clearTransaction(conn, error);
+
     // close all objects; note that no references are retained by the
     // handle list (otherwise all objects would be left until an explicit
     // close of the connection was made) so a reference needs to be acquired
@@ -1534,9 +1539,7 @@ static int dpiConn__startSessionlessTransaction(dpiConn *conn,
     dpiOciXID *ociXid;
 
     // perform checks
-    if (dpiConn__check(conn, __func__, error) < 0)
-        return DPI_FAILURE;
-    if (dpiUtils__checkClientVersion(conn->env->versionInfo, 23, 0, error) < 0)
+    if (dpiUtils__checkClientVersion(conn->env->versionInfo, 23, 6, error) < 0)
         return DPI_FAILURE;
 
     // set the transaction id on the transaction, unless a transaction not
@@ -1612,7 +1615,7 @@ static int dpiConn__startupDatabase(dpiConn *conn, const char *pfile,
 
 
 //-----------------------------------------------------------------------------
-// dpiConn__suspendSessionlessTransactionCall() [INTERNAL]
+// dpiConn__suspendSessionlessTransaction() [INTERNAL]
 //   Suspend a sessionless transaction based on flag (default/postcall).
 //-----------------------------------------------------------------------------
 int dpiConn__suspendSessionlessTransaction(dpiConn *conn, uint32_t flag,
@@ -1620,7 +1623,7 @@ int dpiConn__suspendSessionlessTransaction(dpiConn *conn, uint32_t flag,
 {
     void *transactionHandle;
 
-    if (dpiUtils__checkClientVersion(conn->env->versionInfo, 23, 0, error) < 0)
+    if (dpiUtils__checkClientVersion(conn->env->versionInfo, 23, 6, error) < 0)
         return DPI_FAILURE;
 
     // associate a transaction handle with the connection if one is not already
@@ -1654,6 +1657,8 @@ int dpiConn_beginSessionlessTransaction(dpiConn *conn,
     dpiError error;
     int status;
 
+    if (dpiConn__check(conn, __func__, &error) < 0)
+        return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
     DPI_CHECK_PTR_NOT_NULL(conn, transactionId);
     status = dpiConn__startSessionlessTransaction(conn, transactionId, timeout,
             DPI_TPC_BEGIN_NEW, deferRoundTrip, &error);
@@ -2873,6 +2878,8 @@ int dpiConn_resumeSessionlessTransaction(dpiConn *conn,
     dpiError error;
     int status;
 
+    if (dpiConn__check(conn, __func__, &error) < 0)
+        return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
     DPI_CHECK_PTR_NOT_NULL(conn, transactionId);
     status = dpiConn__startSessionlessTransaction(conn, transactionId, timeout,
             DPI_TPC_BEGIN_RESUME, deferRoundTrip, &error);
@@ -2977,6 +2984,9 @@ int dpiConn_suspendSessionlessTransaction(dpiConn *conn)
         return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
     status = dpiConn__suspendSessionlessTransaction(conn,
             DPI_OCI_SUSPEND_DEFAULT, &error);
+    if (status == DPI_SUCCESS)
+        status = dpiConn__clearTransaction(conn, &error);
+
     return dpiGen__endPublicFn(conn, status, &error);
 }
 

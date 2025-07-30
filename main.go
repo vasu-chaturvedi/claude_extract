@@ -5,9 +5,10 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -21,39 +22,54 @@ var (
 )
 
 func init() {
+	// Setup structured logging
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
+
 	flag.StringVar(appCfgFile, "appCfg", "", "Path to the main application configuration file")
 	flag.StringVar(runCfgFile, "runCfg", "", "Path to the extraction configuration file")
 	flag.StringVar(&mode, "mode", "", "Mode of operation: E - Extract, I - Insert")
 	flag.Parse()
 
-	if mode != "E" && mode != "I" {
-		log.Fatal("Invalid mode. Valid values are 'E' for Extract and 'I' for Insert.")
+	if !slices.Contains([]string{"E", "I"}, mode) {
+		slog.Error("Invalid mode specified", "mode", mode, "valid_modes", []string{"E", "I"})
+		os.Exit(1)
 	}
 	if *appCfgFile == "" || *runCfgFile == "" {
-		log.Fatal("Both appCfg and runCfg must be specified")
+		slog.Error("Configuration files required", "app_cfg", *appCfgFile, "run_cfg", *runCfgFile)
+		os.Exit(1)
 	}
 	if _, err := os.Stat(*appCfgFile); os.IsNotExist(err) {
-		log.Fatalf("Application configuration file does not exist: %s", *appCfgFile)
+		slog.Error("Application configuration file not found", "path", *appCfgFile, "error", err)
+		os.Exit(1)
 	}
 	if _, err := os.Stat(*runCfgFile); os.IsNotExist(err) {
-		log.Fatalf("Extraction configuration file does not exist: %s", *runCfgFile)
+		slog.Error("Extraction configuration file not found", "path", *runCfgFile, "error", err)
+		os.Exit(1)
 	}
 }
 
 func main() {
+	slog.Info("Starting claude_extract", "mode", mode, "app_config", *appCfgFile, "run_config", *runCfgFile)
+	
 	appCfg, err := loadMainConfig(*appCfgFile)
 	if err != nil {
-		log.Fatalf("Failed to load main config: %v", err)
+		slog.Error("Failed to load main config", "path", *appCfgFile, "error", err)
+		os.Exit(1)
 	}
 	runCfg, err := loadExtractionConfig(*runCfgFile)
 	if err != nil {
-		log.Fatalf("Failed to load extraction config: %v", err)
+		slog.Error("Failed to load extraction config", "path", *runCfgFile, "error", err)
+		os.Exit(1)
 	}
 	
 	// Set chunked processing defaults
 	setChunkedDefaults(&runCfg)
 	if len(runCfg.ChunkedProcedures) > 0 {
-		log.Printf("🧩 Chunked procedures configured: %v (chunk size: %d)", runCfg.ChunkedProcedures, runCfg.ChunkSize)
+		slog.Info("Chunked procedures configured", 
+			"procedures", runCfg.ChunkedProcedures, 
+			"chunk_size", runCfg.ChunkSize)
 	}
 
 	// Load templates
@@ -62,25 +78,38 @@ func main() {
 		tmplPath := filepath.Join(runCfg.TemplatePath, fmt.Sprintf("%s.csv", proc))
 		cols, err := readColumnsFromCSV(tmplPath)
 		if err != nil {
-			log.Fatalf("Failed to read template for %s: %v", proc, err)
+			slog.Error("Failed to read template", "procedure", proc, "path", tmplPath, "error", err)
+			os.Exit(1)
 		}
 		templates[proc] = cols
 	}
+	slog.Info("Templates loaded", "count", len(templates), "procedures", runCfg.Procedures)
 
 	connString := fmt.Sprintf(`user="%s" password="%s" connectString="%s:%d/%s"`,
 		appCfg.DBUser, appCfg.DBPassword, appCfg.DBHost, appCfg.DBPort, appCfg.DBSid)
 
 	db, err := sql.Open("godror", connString)
 	if err != nil {
-		log.Fatalf("Failed to connect to DB: %v", err)
+		slog.Error("Failed to connect to database", 
+			"host", appCfg.DBHost, 
+			"port", appCfg.DBPort, 
+			"sid", appCfg.DBSid, 
+			"error", err)
+		os.Exit(1)
 	}
 	defer db.Close()
+	slog.Info("Database connection established", 
+		"host", appCfg.DBHost, 
+		"port", appCfg.DBPort, 
+		"sid", appCfg.DBSid)
 
 	procCount := len(runCfg.Procedures)
 	// Optimize connection pool for high concurrency with improved settings
 	maxConns := appCfg.Concurrency * procCount
 	if maxConns > 200 {
-		log.Printf("⚠️ Warning: Connection pool size (%d) may exceed database limits", maxConns)
+		slog.Warn("Connection pool size may exceed database limits", 
+			"calculated_size", maxConns, 
+			"capped_size", 200)
 		maxConns = 200 // Cap at reasonable limit
 	}
 	
@@ -90,12 +119,18 @@ func main() {
 	db.SetConnMaxLifetime(10 * time.Minute) // Even shorter lifetime for high throughput
 	db.SetConnMaxIdleTime(3 * time.Minute)  // Close idle connections faster
 	
-	log.Printf("🔌 Connection pool configured: %d max connections, %d idle connections", maxConns, maxConns/3)
+	slog.Info("Connection pool configured", 
+		"max_connections", maxConns, 
+		"idle_connections", maxConns/3,
+		"concurrency", appCfg.Concurrency,
+		"procedure_count", procCount)
 
 	sols, err := readSols(appCfg.SolFilePath)
 	if err != nil {
-		log.Fatalf("Failed to read SOL IDs: %v", err)
+		slog.Error("Failed to read SOL IDs", "path", appCfg.SolFilePath, "error", err)
+		os.Exit(1)
 	}
+	slog.Info("SOL IDs loaded", "count", len(sols), "path", appCfg.SolFilePath)
 
 	// Scale buffer size based on expected load
 	bufferSize := max(1000, min(50000, len(sols)*len(runCfg.Procedures)))
@@ -104,7 +139,7 @@ func main() {
 	procSummary := make(map[string]ProcSummary)
 
 	if (mode == "I" && !runCfg.RunInsertionParallel) || (mode == "E" && !runCfg.RunExtractionParallel) {
-		log.Println("Running procedures sequentially as parallel execution is disabled")
+		slog.Info("Running procedures sequentially", "reason", "parallel execution disabled")
 		appCfg.Concurrency = 1
 	}
 
@@ -116,8 +151,14 @@ func main() {
 		LogFile = runCfg.PackageName + "_extract.csv"
 		LogFileSummary = runCfg.PackageName + "_extract_summary.csv"
 	}
+	
+	logFilePath := filepath.Join(appCfg.LogFilePath, LogFile)
+	summaryFilePath := filepath.Join(appCfg.LogFilePath, LogFileSummary)
+	slog.Info("Log files configured", 
+		"procedure_log", logFilePath, 
+		"summary_log", summaryFilePath)
 
-	go writeLog(filepath.Join(appCfg.LogFilePath, LogFile), procLogCh)
+	go writeLog(logFilePath, procLogCh)
 
 	sem := make(chan struct{}, appCfg.Concurrency)
 	var wg sync.WaitGroup
@@ -127,14 +168,21 @@ func main() {
 	var mu sync.Mutex
 	completed := 0
 
+	slog.Info("Starting processing", 
+		"mode", mode, 
+		"total_sols", totalSols, 
+		"concurrency", appCfg.Concurrency,
+		"buffer_size", bufferSize)
+
 	if mode == "E" {
+		slog.Info("Starting extraction mode", "total_sols", totalSols)
 		for _, sol := range sols {
 			wg.Add(1)
 			sem <- struct{}{}
 			go func(solID string) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				log.Printf("➡️ Starting SOL %s", solID)
+				slog.Debug("Starting SOL extraction", "sol_id", solID)
 
 				runExtractionForSol(ctx, db, solID, &runCfg, templates, procLogCh, &summaryMu, procSummary)
 
@@ -144,9 +192,13 @@ func main() {
 					elapsed := time.Since(overallStart)
 					estimatedTotal := time.Duration(float64(elapsed) / float64(completed) * float64(totalSols))
 					eta := estimatedTotal - elapsed
-					log.Printf("✅ Progress: %d/%d (%.2f%%) | Elapsed: %s | ETA: %s",
-						completed, totalSols, float64(completed)*100/float64(totalSols),
-						elapsed.Round(time.Second), eta.Round(time.Second))
+					progress := float64(completed) * 100 / float64(totalSols)
+					slog.Info("Extraction progress", 
+						"completed", completed,
+						"total", totalSols,
+						"progress_percent", fmt.Sprintf("%.2f", progress),
+						"elapsed", elapsed.Round(time.Second).String(),
+						"eta", eta.Round(time.Second).String())
 				}
 				mu.Unlock()
 			}(sol)
@@ -154,10 +206,13 @@ func main() {
 		wg.Wait()
 	} else if mode == "I" {
 		if runCfg.UseProcLevelParallel {
-			log.Printf("🚀 Starting procedure-level parallel execution for %d SOLs with %d procedures", totalSols, len(runCfg.Procedures))
 			totalTasks := totalSols * len(runCfg.Procedures)
-			log.Printf("📊 Total tasks to execute: %d (SOL-Procedure combinations)", totalTasks)
-			log.Printf("🔌 Connection pool: %d max connections, %d idle connections", maxConns, maxConns/2)
+			slog.Info("Starting procedure-level parallel execution", 
+				"total_sols", totalSols, 
+				"procedures", len(runCfg.Procedures),
+				"total_tasks", totalTasks,
+				"max_connections", maxConns,
+				"idle_connections", maxConns/2)
 			
 			// Monitor connection pool stats
 			go func() {
@@ -167,8 +222,12 @@ func main() {
 					select {
 					case <-ticker.C:
 						stats := db.Stats()
-						log.Printf("📊 DB Stats: Open=%d, InUse=%d, Idle=%d, WaitCount=%d, WaitDuration=%s",
-							stats.OpenConnections, stats.InUse, stats.Idle, stats.WaitCount, stats.WaitDuration)
+						slog.Info("Database connection stats",
+							"open_connections", stats.OpenConnections,
+							"in_use", stats.InUse,
+							"idle", stats.Idle,
+							"wait_count", stats.WaitCount,
+							"wait_duration", stats.WaitDuration.String())
 					case <-ctx.Done():
 						return
 					}
@@ -176,16 +235,16 @@ func main() {
 			}()
 			
 			runProceduresWithProcLevelParallelism(ctx, db, sols, &runCfg, procLogCh, &summaryMu, procSummary, appCfg.Concurrency)
-			log.Printf("✅ Completed all %d tasks", totalTasks)
+			slog.Info("Completed all procedure-level tasks", "total_tasks", totalTasks)
 		} else {
-			log.Printf("🚀 Starting SOL-level parallel execution (legacy mode) for %d SOLs", totalSols)
+			slog.Info("Starting SOL-level parallel execution (legacy mode)", "total_sols", totalSols)
 			for _, sol := range sols {
 				wg.Add(1)
 				sem <- struct{}{}
 				go func(solID string) {
 					defer wg.Done()
 					defer func() { <-sem }()
-					log.Printf("➡️ Starting SOL %s", solID)
+					slog.Debug("Starting SOL procedures", "sol_id", solID)
 
 					runProceduresForSol(ctx, db, solID, &runCfg, procLogCh, &summaryMu, procSummary)
 
@@ -195,9 +254,13 @@ func main() {
 						elapsed := time.Since(overallStart)
 						estimatedTotal := time.Duration(float64(elapsed) / float64(completed) * float64(totalSols))
 						eta := estimatedTotal - elapsed
-						log.Printf("✅ Progress: %d/%d (%.2f%%) | Elapsed: %s | ETA: %s",
-							completed, totalSols, float64(completed)*100/float64(totalSols),
-							elapsed.Round(time.Second), eta.Round(time.Second))
+						progress := float64(completed) * 100 / float64(totalSols)
+						slog.Info("SOL-level progress", 
+							"completed", completed,
+							"total", totalSols,
+							"progress_percent", fmt.Sprintf("%.2f", progress),
+							"elapsed", elapsed.Round(time.Second).String(),
+							"eta", eta.Round(time.Second).String())
 					}
 					mu.Unlock()
 				}(sol)
@@ -207,31 +270,46 @@ func main() {
 	}
 	close(procLogCh)
 
-	writeSummary(filepath.Join(appCfg.LogFilePath, LogFileSummary), procSummary)
+	slog.Info("Writing summary files", "summary_path", summaryFilePath)
+	writeSummary(summaryFilePath, procSummary)
 	if mode == "E" {
+		slog.Info("Merging extraction files")
 		mergeFiles(&runCfg)
 	}
 	
 	// Clean up prepared statements
 	globalStmtCache.Close()
 	procStmtCache.Close()
+	slog.Info("Cleaned up prepared statement caches")
 	
 	// Final performance summary
 	finalStats := db.Stats()
-	log.Printf("📊 Final DB Stats: MaxOpen=%d, Open=%d, InUse=%d, Idle=%d, WaitCount=%d, WaitDuration=%s",
-		finalStats.MaxOpenConnections, finalStats.OpenConnections, finalStats.InUse, finalStats.Idle, finalStats.WaitCount, finalStats.WaitDuration)
+	slog.Info("Final database stats",
+		"max_open", finalStats.MaxOpenConnections,
+		"open", finalStats.OpenConnections,
+		"in_use", finalStats.InUse,
+		"idle", finalStats.Idle,
+		"wait_count", finalStats.WaitCount,
+		"wait_duration", finalStats.WaitDuration.String())
 	
 	// Performance metrics summary
 	totalQueries, avgDuration, cacheHitRate, slowQueries := globalMetrics.GetStats()
 	totalRowsProcessed := globalMetrics.TotalRowsProcessed
 	totalBytesWritten := globalMetrics.TotalBytesWritten
+	totalDuration := time.Since(overallStart)
 	
-	log.Printf("⚡ Performance Summary:")
-	log.Printf("   🔢 Total Queries: %d", totalQueries)
-	log.Printf("   ⏱️  Average Query Time: %s", avgDuration.Round(time.Millisecond))
-	log.Printf("   💾 Cache Hit Rate: %.1f%%", cacheHitRate)
-	log.Printf("   🐌 Slow Queries (>1s): %d", slowQueries)
-	log.Printf("   📊 Rows Processed: %d", totalRowsProcessed)
-	log.Printf("   💿 Bytes Written: %.2f MB", float64(totalBytesWritten)/(1024*1024))
-	log.Printf("🎯 All done! Processed %d SOLs in %s", totalSols, time.Since(overallStart).Round(time.Second))
+	slog.Info("Performance summary",
+		"total_queries", totalQueries,
+		"avg_query_time", avgDuration.Round(time.Millisecond).String(),
+		"cache_hit_rate_percent", fmt.Sprintf("%.1f", cacheHitRate),
+		"slow_queries", slowQueries,
+		"rows_processed", totalRowsProcessed,
+		"bytes_written_mb", fmt.Sprintf("%.2f", float64(totalBytesWritten)/(1024*1024)),
+		"total_duration", totalDuration.Round(time.Second).String(),
+		"sols_processed", totalSols)
+	
+	slog.Info("Processing completed successfully", 
+		"mode", mode, 
+		"total_sols", totalSols, 
+		"duration", totalDuration.Round(time.Second).String())
 }

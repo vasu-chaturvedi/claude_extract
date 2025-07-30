@@ -2,7 +2,7 @@ module claude_extract
 
 go 1.24.5
 
-require github.com/godror/godror v0.49.0
+require github.com/godror/godror v0.49.1
 
 require (
 	github.com/VictoriaMetrics/easyproto v0.1.4 // indirect

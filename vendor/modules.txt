@@ -4,7 +4,7 @@ github.com/VictoriaMetrics/easyproto
 # github.com/go-logfmt/logfmt v0.6.0
 ## explicit; go 1.17
 github.com/go-logfmt/logfmt
-# github.com/godror/godror v0.49.0
+# github.com/godror/godror v0.49.1
 ## explicit; go 1.23.0
 github.com/godror/godror
 github.com/godror/godror/dsn

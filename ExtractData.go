@@ -6,11 +6,11 @@ import (
 	"database/sql"
 	"encoding/csv"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,55 +36,7 @@ var (
 	}
 )
 
-// Prepared statement cache for performance optimization
-type PreparedStmtCache struct {
-	mu    sync.RWMutex
-	stmts map[string]*sql.Stmt
-}
-
-func NewPreparedStmtCache() *PreparedStmtCache {
-	return &PreparedStmtCache{
-		stmts: make(map[string]*sql.Stmt),
-	}
-}
-
-func (c *PreparedStmtCache) GetOrPrepare(db *sql.DB, query string) (*sql.Stmt, error) {
-	c.mu.RLock()
-	if stmt, exists := c.stmts[query]; exists {
-		c.mu.RUnlock()
-		globalMetrics.RecordCacheHit()
-		return stmt, nil
-	}
-	c.mu.RUnlock()
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	
-	// Double-check pattern to avoid race condition
-	if stmt, exists := c.stmts[query]; exists {
-		globalMetrics.RecordCacheHit()
-		return stmt, nil
-	}
-
-	globalMetrics.RecordCacheMiss()
-	stmt, err := db.Prepare(query)
-	if err != nil {
-		return nil, err
-	}
-	
-	c.stmts[query] = stmt
-	return stmt, nil
-}
-
-func (c *PreparedStmtCache) Close() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	
-	for _, stmt := range c.stmts {
-		stmt.Close()
-	}
-	c.stmts = make(map[string]*sql.Stmt)
-}
+// Legacy prepared statement cache - replaced by generic cache in cache.go
 
 var globalStmtCache = NewPreparedStmtCache()
 
@@ -102,7 +54,7 @@ func runExtractionForSol(ctx context.Context, db *sql.DB, solID string, procConf
 
 				// Check if this procedure uses chunked logic
 				if isChunkedProcedure(proc, procConfig.ChunkedProcedures) {
-					log.Printf("🧩 Starting chunked extraction for %s, SOL %s", proc, solID)
+					slog.Debug("Starting chunked extraction", "procedure", proc, "sol_id", solID)
 					chunkResultsCh := make(chan ChunkResult, 100)
 					runChunkedExtractionForSol(ctx, db, solID, proc, procConfig, templates, logCh, chunkResultsCh)
 					close(chunkResultsCh)
@@ -134,7 +86,7 @@ func runExtractionForSol(ctx context.Context, db *sql.DB, solID string, procConf
 					}
 				} else {
 					// Regular extraction logic
-					log.Printf("📥 Extracting %s for SOL %s", proc, solID)
+					slog.Debug("Starting extraction", "procedure", proc, "sol_id", solID)
 					err := extractData(ctx, db, proc, solID, procConfig, templates)
 					end := time.Now()
 
@@ -170,7 +122,10 @@ func runExtractionForSol(ctx context.Context, db *sql.DB, solID string, procConf
 					}
 					summary[proc] = s
 					mu.Unlock()
-					log.Printf("✅ Completed %s for SOL %s in %s", proc, solID, end.Sub(start).Round(time.Millisecond))
+					slog.Debug("Completed extraction", 
+						"procedure", proc, 
+						"sol_id", solID, 
+						"duration", end.Sub(start).Round(time.Millisecond).String())
 				}
 			}
 		}()
@@ -208,7 +163,10 @@ func extractData(ctx context.Context, db *sql.DB, procName, solID string, cfg *E
 		return fmt.Errorf("query failed: %w", err)
 	}
 	defer rows.Close()
-	log.Printf("🧮 Query executed for %s (SOL %s) in %s", procName, solID, time.Since(start).Round(time.Millisecond))
+	slog.Debug("Query executed", 
+		"procedure", procName, 
+		"sol_id", solID, 
+		"duration", time.Since(start).Round(time.Millisecond).String())
 
 	spoolPath := filepath.Join(cfg.SpoolOutputPath, fmt.Sprintf("%s_%s.spool", procName, solID))
 	f, err := os.Create(spoolPath)
@@ -285,11 +243,11 @@ func mergeFiles(cfg *ExtractionConfig) error {
 	for _, proc := range cfg.Procedures {
 		// Skip merging for chunked procedures - they handle their own file output
 		if isChunkedProcedure(proc, cfg.ChunkedProcedures) {
-			log.Printf("📦 Skipping merge for chunked procedure: %s (files already in final format)", proc)
+			slog.Info("Skipping merge for chunked procedure", "procedure", proc, "reason", "files already in final format")
 			continue
 		}
 
-		log.Printf("📦 Starting merge for procedure: %s", proc)
+		slog.Info("Starting merge for procedure", "procedure", proc)
 
 		pattern := filepath.Join(cfg.SpoolOutputPath, fmt.Sprintf("%s_*.spool", proc))
 		finalFile := filepath.Join(cfg.SpoolOutputPath, fmt.Sprintf("%s.txt", proc))
@@ -298,7 +256,7 @@ func mergeFiles(cfg *ExtractionConfig) error {
 		if err != nil {
 			return fmt.Errorf("glob failed: %w", err)
 		}
-		sort.Strings(files)
+		slices.Sort(files)
 
 		outFile, err := os.Create(finalFile)
 		if err != nil {
@@ -327,7 +285,11 @@ func mergeFiles(cfg *ExtractionConfig) error {
 			os.Remove(file)
 		}
 		writer.Flush()
-		log.Printf("📑 Merged %d files into %s in %s", len(files), finalFile, time.Since(start).Round(time.Second))
+		slog.Info("Merge completed", 
+			"procedure", proc,
+			"file_count", len(files), 
+			"output_file", finalFile, 
+			"duration", time.Since(start).Round(time.Second).String())
 	}
 	return nil
 }

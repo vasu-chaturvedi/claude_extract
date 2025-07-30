@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,7 +28,7 @@ type ChunkResult struct {
 // runChunkedExtractionForSol performs chunked extraction for a single SOL with debit-credit balancing
 func runChunkedExtractionForSol(ctx context.Context, db *sql.DB, solID string, procedure string, config *ExtractionConfig, templates map[string][]ColumnConfig, logCh chan<- ProcLog, chunkResultsCh chan<- ChunkResult) {
 	startTime := time.Now()
-	log.Printf("🧩 Starting chunked extraction for SOL %s, procedure %s", solID, procedure)
+	slog.Info("Starting chunked extraction", "sol_id", solID, "procedure", procedure)
 
 	chunkProcName := procedure + "_EXTRACT"
 	chunkNum := 1
@@ -36,14 +36,18 @@ func runChunkedExtractionForSol(ctx context.Context, db *sql.DB, solID string, p
 
 	for {
 		chunkStart := time.Now()
-		log.Printf("🔄 Processing chunk %d for SOL %s, procedure %s", chunkNum, solID, procedure)
+		slog.Debug("Processing chunk", "chunk_num", chunkNum, "sol_id", solID, "procedure", procedure)
 
 		// Modern chunked call: gets SYS_REFCURSOR directly from Oracle proc!
 		records, hasMore, err := callChunkProcedure(ctx, db, config.PackageName, chunkProcName, solID, chunkNum, config.ChunkSize)
 		chunkEnd := time.Now()
 
 		if err != nil {
-			log.Printf("❌ Chunk %d failed for SOL %s, procedure %s: %v", chunkNum, solID, procedure, err)
+			slog.Error("Chunk processing failed", 
+				"chunk_num", chunkNum, 
+				"sol_id", solID, 
+				"procedure", procedure, 
+				"error", err)
 
 			plog := ProcLog{
 				SolID:         solID,
@@ -70,11 +74,11 @@ func runChunkedExtractionForSol(ctx context.Context, db *sql.DB, solID string, p
 		}
 
 		if len(records) == 0 && chunkNum == 1 {
-			log.Printf("📄 No records found for SOL %s, procedure %s", solID, procedure)
+			slog.Info("No records found", "sol_id", solID, "procedure", procedure)
 
 			fileName := generateChunkFileName(solID, procedure, 1, 1, config.SpoolOutputPath)
 			if err := createEmptyFile(fileName); err != nil {
-				log.Printf("❌ Failed to create empty file %s: %v", fileName, err)
+				slog.Error("Failed to create empty file", "file", fileName, "error", err)
 			}
 
 			plog := ProcLog{
@@ -105,7 +109,7 @@ func runChunkedExtractionForSol(ctx context.Context, db *sql.DB, solID string, p
 		if len(records) > 0 {
 			fileName := generateChunkFileName(solID, procedure, chunkNum, -1, config.SpoolOutputPath)
 			if err := writeChunkToFile(fileName, records, templates[procedure], config); err != nil {
-				log.Printf("❌ Failed to write chunk %d for SOL %s, procedure %s: %v", chunkNum, solID, procedure, err)
+				slog.Error("Failed to write chunk", "chunk_num", chunkNum, "sol_id", solID, "procedure", procedure, "error", err)
 
 				plog := ProcLog{
 					SolID:         solID,
@@ -132,7 +136,7 @@ func runChunkedExtractionForSol(ctx context.Context, db *sql.DB, solID string, p
 			}
 
 			totalRecords += len(records)
-			log.Printf("✅ Chunk %d completed for SOL %s, procedure %s: %d records", chunkNum, solID, procedure, len(records))
+			slog.Debug("Chunk completed", "chunk_num", chunkNum, "sol_id", solID, "procedure", procedure, "record_count", len(records))
 
 			plog := ProcLog{
 				SolID:         solID,
@@ -167,8 +171,12 @@ func runChunkedExtractionForSol(ctx context.Context, db *sql.DB, solID string, p
 		renameChunkFiles(solID, procedure, chunkNum, config.SpoolOutputPath)
 	}
 
-	log.Printf("🎯 Completed chunked extraction for SOL %s, procedure %s: %d chunks, %d total records in %s",
-		solID, procedure, chunkNum, totalRecords, time.Since(startTime).Round(time.Millisecond))
+	slog.Info("Completed chunked extraction", 
+		"sol_id", solID, 
+		"procedure", procedure, 
+		"total_chunks", chunkNum, 
+		"total_records", totalRecords, 
+		"duration", time.Since(startTime).Round(time.Millisecond).String())
 }
 
 // callChunkProcedure calls the Oracle procedure with SYS_REFCURSOR output for a chunk
