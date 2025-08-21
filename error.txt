@@ -1,0 +1,39 @@
+panic: reflect: call of reflect.Value.Type on zero Value
+
+goroutine 107 [running]:
+reflect.Value.abiTypeSlow({0x0?, 0x0?, 0x0?})
+        /home/BANKMIG/vasu/go/src/reflect/value.go:2400 +0xee
+reflect.Value.typeSlow({0x0?, 0x0?, 0x0?})
+        /home/BANKMIG/vasu/go/src/reflect/value.go:2388 +0x1d
+reflect.Value.Type(...)
+        /home/BANKMIG/vasu/go/src/reflect/value.go:2383
+github.com/godror/godror.(*conn).getStructObjectType(0xc0000f42c8, {0x7c00a8, 0xbce720}, {0x7340c0, 0x0}, {0x0, 0x0})
+        /home/BANKMIG/vasu/workbench/claude_extract/vendor/github.com/godror/godror/stmt.go:3400 +0x17c
+github.com/godror/godror.(*statement).bindVarTypeSwitch(0xc00085a160, {0x7c00a8, 0xbce720}, 0xc000096578, 0xc000596138, {0x7340c0, 0x0})
+        /home/BANKMIG/vasu/workbench/claude_extract/vendor/github.com/godror/godror/stmt.go:1458 +0x27f2
+github.com/godror/godror.(*statement).bindVars(0xc00085a160, {0x7c00a8, 0xbce720}, {0xc000096280, 0x4, 0x4}, 0x0)
+        /home/BANKMIG/vasu/workbench/claude_extract/vendor/github.com/godror/godror/stmt.go:1002 +0x14b3
+github.com/godror/godror.(*statement).ExecContext(0xc00085a160, {0x7c00a8, 0xbce720}, {0xc000096280, 0x4, 0x4})
+        /home/BANKMIG/vasu/workbench/claude_extract/vendor/github.com/godror/godror/stmt.go:486 +0x5e5
+database/sql.ctxDriverStmtExec({0x7c00a8, 0xbce720}, {0x7c02d8, 0xc00085a160}, {0xc000096280, 0x4, 0x4?})
+        /home/BANKMIG/vasu/go/src/database/sql/ctxutil.go:65 +0xa3
+database/sql.resultFromStatement({0x7c00a8, 0xbce720}, {0x7bfe30, 0xc0000f42c8}, 0xc000502f30, {0xc0005032f0, 0x4, 0x4})
+        /home/BANKMIG/vasu/go/src/database/sql/sql.go:2680 +0x125
+database/sql.(*DB).execDC(0x1?, {0x7c00a8, 0xbce720}, 0xc000732100, 0x0?, {0xc0003c2040, 0x31}, {0xc0005032f0, 0x4, 0x4})
+        /home/BANKMIG/vasu/go/src/database/sql/sql.go:1732 +0x3f2
+database/sql.(*DB).exec(0xc00009cdd0, {0x7c00a8, 0xbce720}, {0xc0003c2040, 0x31}, {0xc0005032f0, 0x4, 0x4}, 0xa0?)
+        /home/BANKMIG/vasu/go/src/database/sql/sql.go:1693 +0xcf
+database/sql.(*DB).ExecContext.func1(0x40?)
+        /home/BANKMIG/vasu/go/src/database/sql/sql.go:1672 +0x4f
+database/sql.(*DB).retry(0x7fcfe19afb48?, 0xc0005031d0)
+        /home/BANKMIG/vasu/go/src/database/sql/sql.go:1576 +0x42
+database/sql.(*DB).ExecContext(0x71a2e0?, {0x7c00a8?, 0xbce720?}, {0xc0003c2040?, 0x2?}, {0xc0003b72f0?, 0x0?, 0x674063?})
+        /home/BANKMIG/vasu/go/src/database/sql/sql.go:1671 +0xc8
+main.callChunkProcedure({0x7c00a8, 0xbce720}, 0xc00009cdd0, {0xc000012649?, 0xc0003b7a90?}, {0xc00038a050, 0xd}, {0xc000012cd2, 0x2}, 0x1, ...)
+        /home/BANKMIG/vasu/workbench/claude_extract/chunkedExtraction.go:187 +0x24e
+main.runChunkedExtractionForSol({0x7c00a8, 0xbce720}, 0xc00009cdd0, {0xc000012cd2, 0x2}, {0xc00001266a, 0x5}, 0xc0000963c0, 0xc00009ae10, 0xc0000c2150, ...)
+        /home/BANKMIG/vasu/workbench/claude_extract/chunkedExtraction.go:42 +0x370
+main.runExtractionForSol.func1()
+        /home/BANKMIG/vasu/workbench/claude_extract/ExtractData.go:59 +0x32c
+created by main.runExtractionForSol in goroutine 23
+        /home/BANKMIG/vasu/workbench/claude_extract/ExtractData.go:50 +0xba
