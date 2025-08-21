@@ -179,26 +179,30 @@ func runChunkedExtractionForSol(ctx context.Context, db *sql.DB, solID string, p
                 "duration", time.Since(startTime).Round(time.Millisecond).String())
 }
 
-// callChunkProcedure calls the Oracle procedure with SYS_REFCURSOR output for a chunk
+// callChunkProcedure calls the Oracle procedure with SYS_REFCURSOR output for a chunk  
 func callChunkProcedure(ctx context.Context, db *sql.DB, pkgName, procName, solID string, chunkNum, chunkSize int) ([]DatabaseRecord, bool, error) {
         stmt := fmt.Sprintf(`BEGIN %s.%s(:1, :2, :3, :4); END;`, pkgName, procName)
 
-        var cursor *sql.Rows
+        // Initialize cursor variable properly for godror
+        cursor := sql.Out{Dest: new(*sql.Rows)}
         _, err := db.ExecContext(ctx, stmt,
                 solID,
                 chunkNum,
                 chunkSize,
-                sql.Out{Dest: &cursor},
+                cursor,
         )
         if err != nil {
                 return nil, false, fmt.Errorf("failed to execute chunk procedure: %w", err)
         }
-        if cursor == nil {
+        
+        // Extract rows from the Out parameter
+        rows, ok := cursor.Dest.(**sql.Rows)
+        if !ok || rows == nil || *rows == nil {
                 return nil, false, nil
         }
-        defer cursor.Close()
+        defer (*rows).Close()
 
-        records, err := rowsToMaps(cursor)
+        records, err := rowsToMaps(*rows)
         if err != nil {
                 return nil, false, fmt.Errorf("failed to convert rows to maps: %w", err)
         }
