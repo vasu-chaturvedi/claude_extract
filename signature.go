@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"fmt"
@@ -11,6 +12,10 @@ import (
 	"sync"
 	"time"
 )
+
+// dirCache caches created directories to avoid repeated MkdirAll calls
+var dirCache = make(map[string]bool)
+var dirCacheMu sync.RWMutex
 
 // runSignatureExtraction executes the signature extraction for all SOLs
 func runSignatureExtraction(ctx context.Context, db *sql.DB, sols []string, procConfig *ExtractionConfig, procLogCh chan<- ProcLog, mu *sync.Mutex, procSummary map[string]ProcSummary, concurrency int) {
@@ -183,12 +188,21 @@ func extractSignaturesForSol(ctx context.Context, db *sql.DB, solID string) erro
 	return nil
 }
 
-// writeBlobToFile writes a blob to the specified file path
+// writeBlobToFile writes a blob to the specified file path with buffered I/O
 func writeBlobToFile(filename string, blob []byte) error {
-	// Ensure the directory exists
+	// Ensure the directory exists - use cache to avoid repeated MkdirAll calls
 	dir := filepath.Dir(filename)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create directory %s: %w", dir, err)
+	dirCacheMu.RLock()
+	dirExists := dirCache[dir]
+	dirCacheMu.RUnlock()
+
+	if !dirExists {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", dir, err)
+		}
+		dirCacheMu.Lock()
+		dirCache[dir] = true
+		dirCacheMu.Unlock()
 	}
 
 	// Create the file
@@ -198,8 +212,12 @@ func writeBlobToFile(filename string, blob []byte) error {
 	}
 	defer file.Close()
 
+	// Use buffered writer for better I/O performance (64KB buffer)
+	buf := bufio.NewWriterSize(file, 64*1024)
+	defer buf.Flush()
+
 	// Write the blob data
-	_, err = file.Write(blob)
+	_, err = buf.Write(blob)
 	if err != nil {
 		return fmt.Errorf("failed to write blob data to file %s: %w", filename, err)
 	}
