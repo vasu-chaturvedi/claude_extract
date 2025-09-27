@@ -17,6 +17,20 @@ import (
 var dirCache = make(map[string]bool)
 var dirCacheMu sync.RWMutex
 
+// blobPool reuses byte slices for blob data to reduce memory allocations
+var blobPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 0, 64*1024) // 64KB initial capacity
+	},
+}
+
+// blobWriteTask represents a file writing task
+type blobWriteTask struct {
+	filename string
+	data     []byte
+	done     chan error
+}
+
 // runSignatureExtraction executes the signature extraction for all SOLs
 func runSignatureExtraction(ctx context.Context, db *sql.DB, sols []string, procConfig *ExtractionConfig, procLogCh chan<- ProcLog, mu *sync.Mutex, procSummary map[string]ProcSummary, concurrency int) {
 	var wg sync.WaitGroup
@@ -92,7 +106,7 @@ func runSignatureExtraction(ctx context.Context, db *sql.DB, sols []string, proc
 			localCompleted := completed
 			progressMu.Unlock()
 
-			if localCompleted%10 == 0 || localCompleted == totalSols {
+			if localCompleted%50 == 0 || localCompleted == totalSols {
 				elapsed := time.Since(overallStart)
 				estimatedTotal := time.Duration(float64(elapsed) / float64(localCompleted) * float64(totalSols))
 				eta := estimatedTotal - elapsed
@@ -141,39 +155,105 @@ func extractSignaturesForSol(ctx context.Context, db *sql.DB, solID string) erro
 		"sol_id", solID,
 		"duration", time.Since(start).Round(time.Millisecond).String())
 
-	signatureCount := 0
-	totalBytes := int64(0)
+	// First pass: collect all blobs and directories for batch processing
+	type blobData struct {
+		filename string
+		data     []byte
+	}
+	var blobs []blobData
+	dirSet := make(map[string]bool)
 
 	for rows.Next() {
 		var filename string
+		// Use pooled buffer for blob data
+		buf := blobPool.Get().([]byte)
 		var imageBlob []byte
 
 		if err := rows.Scan(&filename, &imageBlob); err != nil {
+			blobPool.Put(buf[:0])
 			return fmt.Errorf("failed to scan signature row for SOL %s: %w", solID, err)
 		}
 
 		if len(imageBlob) == 0 {
+			blobPool.Put(buf[:0])
 			slog.Warn("Empty blob found", "sol_id", solID, "filename", filename)
 			continue
 		}
 
-		// Write blob to file using the filename from database (which includes path)
-		if err := writeBlobToFile(filename, imageBlob); err != nil {
-			return fmt.Errorf("failed to write signature file %s for SOL %s: %w", filename, solID, err)
-		}
-
-		signatureCount++
-		totalBytes += int64(len(imageBlob))
-
-		slog.Debug("Signature file written",
-			"sol_id", solID,
-			"filename", filename,
-			"size_bytes", len(imageBlob))
+		// Copy blob data to pooled buffer
+		buf = buf[:0]
+		buf = append(buf, imageBlob...)
+		blobs = append(blobs, blobData{filename: filename, data: buf})
+		dirSet[filepath.Dir(filename)] = true
 	}
 
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("error iterating signature rows for SOL %s: %w", solID, err)
 	}
+
+	// Batch create all directories
+	if err := batchCreateDirectories(dirSet); err != nil {
+		// Return buffers to pool on error
+		for _, blob := range blobs {
+			blobPool.Put(blob.data[:0])
+		}
+		return fmt.Errorf("failed to create directories for SOL %s: %w", solID, err)
+	}
+
+	// Create file writer workers
+	fileWriteCh := make(chan blobWriteTask, min(len(blobs), 100))
+	var writerWg sync.WaitGroup
+	workerCount := min(4, len(blobs))
+
+	for i := 0; i < workerCount; i++ {
+		writerWg.Add(1)
+		go func() {
+			defer writerWg.Done()
+			for task := range fileWriteCh {
+				err := writeBlobToFileOptimized(task.filename, task.data)
+				task.done <- err
+			}
+		}()
+	}
+
+	// Process all blobs concurrently
+	signatureCount := 0
+	totalBytes := int64(0)
+
+	for _, blob := range blobs {
+		done := make(chan error, 1)
+		task := blobWriteTask{
+			filename: blob.filename,
+			data:     blob.data,
+			done:     done,
+		}
+
+		fileWriteCh <- task
+		if err := <-done; err != nil {
+			// Return remaining buffers to pool on error
+			for _, remainingBlob := range blobs {
+				blobPool.Put(remainingBlob.data[:0])
+			}
+			close(fileWriteCh)
+			writerWg.Wait()
+			return fmt.Errorf("failed to write signature file %s for SOL %s: %w", blob.filename, solID, err)
+		}
+
+		signatureCount++
+		totalBytes += int64(len(blob.data))
+
+		slog.Debug("Signature file written",
+			"sol_id", solID,
+			"filename", blob.filename,
+			"size_bytes", len(blob.data))
+
+		// Return buffer to pool
+		blobPool.Put(blob.data[:0])
+	}
+
+	// Clean up workers
+	close(fileWriteCh)
+	writerWg.Wait()
 
 	// Record performance metrics
 	queryDuration := time.Since(start)
@@ -188,7 +268,52 @@ func extractSignaturesForSol(ctx context.Context, db *sql.DB, solID string) erro
 	return nil
 }
 
-// writeBlobToFile writes a blob to the specified file path with buffered I/O
+// batchCreateDirectories creates all directories in the set efficiently
+func batchCreateDirectories(dirSet map[string]bool) error {
+	for dir := range dirSet {
+		dirCacheMu.RLock()
+		exists := dirCache[dir]
+		dirCacheMu.RUnlock()
+
+		if !exists {
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return fmt.Errorf("failed to create directory %s: %w", dir, err)
+			}
+			dirCacheMu.Lock()
+			dirCache[dir] = true
+			dirCacheMu.Unlock()
+		}
+	}
+	return nil
+}
+
+// writeBlobToFileOptimized writes a blob to the specified file path with optimized buffering
+func writeBlobToFileOptimized(filename string, blob []byte) error {
+	// Create the file
+	file, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("failed to create file %s: %w", filename, err)
+	}
+	defer file.Close()
+
+	// Use dynamic buffer sizing based on blob size
+	bufSize := min(len(blob), 8*1024) // Cap at 8KB for small files
+	if bufSize < 1024 {
+		bufSize = 1024 // Minimum 1KB buffer
+	}
+	buf := bufio.NewWriterSize(file, bufSize)
+	defer buf.Flush()
+
+	// Write the blob data
+	_, err = buf.Write(blob)
+	if err != nil {
+		return fmt.Errorf("failed to write blob data to file %s: %w", filename, err)
+	}
+
+	return nil
+}
+
+// writeBlobToFile writes a blob to the specified file path with buffered I/O (legacy function)
 func writeBlobToFile(filename string, blob []byte) error {
 	// Ensure the directory exists - use cache to avoid repeated MkdirAll calls
 	dir := filepath.Dir(filename)
@@ -205,24 +330,7 @@ func writeBlobToFile(filename string, blob []byte) error {
 		dirCacheMu.Unlock()
 	}
 
-	// Create the file
-	file, err := os.Create(filename)
-	if err != nil {
-		return fmt.Errorf("failed to create file %s: %w", filename, err)
-	}
-	defer file.Close()
-
-	// Use buffered writer for better I/O performance (64KB buffer)
-	buf := bufio.NewWriterSize(file, 64*1024)
-	defer buf.Flush()
-
-	// Write the blob data
-	_, err = buf.Write(blob)
-	if err != nil {
-		return fmt.Errorf("failed to write blob data to file %s: %w", filename, err)
-	}
-
-	return nil
+	return writeBlobToFileOptimized(filename, blob)
 }
 
 // runSignatureExtractionWithProcLevelParallelism runs signature extraction with procedure-level parallelism
@@ -314,7 +422,7 @@ func runSignatureExtractionWithProcLevelParallelism(ctx context.Context, db *sql
 				localCompleted := completed
 				progressMu.Unlock()
 
-				if localCompleted%5 == 0 || localCompleted == totalTasks {
+				if localCompleted%50 == 0 || localCompleted == totalTasks {
 					elapsed := time.Since(overallStart)
 					rate := float64(localCompleted) / elapsed.Seconds()
 					eta := time.Duration(float64(totalTasks-localCompleted)/rate) * time.Second
