@@ -65,7 +65,7 @@ func (c *Cache[K, V]) GetOrSet(key K, factory func() (V, error)) (V, error) {
 	// Create new value under write lock
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	// Double-check pattern to avoid race condition
 	if value, exists := c.items[key]; exists {
 		return value, nil
@@ -76,7 +76,7 @@ func (c *Cache[K, V]) GetOrSet(key K, factory func() (V, error)) (V, error) {
 		var zero V
 		return zero, err
 	}
-	
+
 	c.items[key] = value
 	return value, nil
 }
@@ -118,7 +118,7 @@ func (c *PreparedStmtCache) Get(query string) (*sql.Stmt, bool) {
 func (c *PreparedStmtCache) Close() {
 	c.cache.mu.Lock()
 	defer c.cache.mu.Unlock()
-	
+
 	for _, stmt := range c.cache.items {
 		if stmt != nil {
 			stmt.Close()

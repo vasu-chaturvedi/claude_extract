@@ -29,11 +29,11 @@ func init() {
 
 	flag.StringVar(appCfgFile, "appCfg", "", "Path to the main application configuration file")
 	flag.StringVar(runCfgFile, "runCfg", "", "Path to the extraction configuration file")
-	flag.StringVar(&mode, "mode", "", "Mode of operation: E - Extract, I - Insert")
+	flag.StringVar(&mode, "mode", "", "Mode of operation: E - Extract, I - Insert, S - Signature")
 	flag.Parse()
 
-	if !slices.Contains([]string{"E", "I"}, mode) {
-		slog.Error("Invalid mode specified", "mode", mode, "valid_modes", []string{"E", "I"})
+	if !slices.Contains([]string{"E", "I", "S"}, mode) {
+		slog.Error("Invalid mode specified", "mode", mode, "valid_modes", []string{"E", "I", "S"})
 		os.Exit(1)
 	}
 	if *appCfgFile == "" || *runCfgFile == "" {
@@ -138,7 +138,7 @@ func main() {
 	var summaryMu sync.Mutex
 	procSummary := make(map[string]ProcSummary)
 
-	if (mode == "I" && !runCfg.RunInsertionParallel) || (mode == "E" && !runCfg.RunExtractionParallel) {
+	if (mode == "I" && !runCfg.RunInsertionParallel) || (mode == "E" && !runCfg.RunExtractionParallel) || (mode == "S" && !runCfg.RunExtractionParallel) {
 		slog.Info("Running procedures sequentially", "reason", "parallel execution disabled")
 		appCfg.Concurrency = 1
 	}
@@ -150,6 +150,9 @@ func main() {
 	} else if mode == "E" {
 		LogFile = runCfg.PackageName + "_extract.csv"
 		LogFileSummary = runCfg.PackageName + "_extract_summary.csv"
+	} else if mode == "S" {
+		LogFile = runCfg.PackageName + "_signature.csv"
+		LogFileSummary = runCfg.PackageName + "_signature_summary.csv"
 	}
 
 	logFilePath := filepath.Join(appCfg.LogFilePath, LogFile)
@@ -266,6 +269,18 @@ func main() {
 				}(sol)
 			}
 			wg.Wait()
+		}
+	} else if mode == "S" {
+		if runCfg.UseProcLevelParallel {
+			slog.Info("Starting procedure-level parallel signature extraction",
+				"total_sols", totalSols,
+				"max_connections", maxConns)
+
+			runSignatureExtractionWithProcLevelParallelism(ctx, db, sols, &runCfg, procLogCh, &summaryMu, procSummary, appCfg.Concurrency)
+			slog.Info("Completed procedure-level signature extraction", "total_sols", totalSols)
+		} else {
+			slog.Info("Starting SOL-level parallel signature extraction", "total_sols", totalSols)
+			runSignatureExtraction(ctx, db, sols, &runCfg, procLogCh, &summaryMu, procSummary, appCfg.Concurrency)
 		}
 	}
 	close(procLogCh)

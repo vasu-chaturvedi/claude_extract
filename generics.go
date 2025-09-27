@@ -165,7 +165,7 @@ func FilterOptional[T any](o Optional[T], predicate func(T) bool) Optional[T] {
 // TimedResult represents a result with execution timing information
 type TimedResult[T any] struct {
 	Result[T]
-	Duration time.Duration
+	Duration  time.Duration
 	StartTime time.Time
 	EndTime   time.Time
 }
@@ -236,21 +236,21 @@ func (b *Batch[T]) Clear() {
 // ProcessBatch processes items in batches with a generic processor function
 func ProcessBatch[T, R any](items []T, batchSize int, processor func([]T) ([]R, error)) ([]R, error) {
 	var results []R
-	
+
 	for i := 0; i < len(items); i += batchSize {
 		end := i + batchSize
 		if end > len(items) {
 			end = len(items)
 		}
-		
+
 		batch := items[i:end]
 		batchResults, err := processor(batch)
 		if err != nil {
 			return nil, fmt.Errorf("batch processing failed at index %d: %w", i, err)
 		}
-		
+
 		results = append(results, batchResults...)
 	}
-	
+
 	return results, nil
 }
